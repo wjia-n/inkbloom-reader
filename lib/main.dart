@@ -293,26 +293,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
               single
           ];
     if (files.isEmpty) return;
-    // Progress dialog: the user must SEE work happening, never a
-    // frozen screen. Parsing itself runs in an isolate (see
-    // isolate_parse.dart), so the UI stays alive on big books.
-    final progress = ValueNotifier<String>('Starting…');
-    if (mounted) {
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => ValueListenableBuilder<String>(
-          valueListenable: progress,
-          builder: (_, v, __) => AlertDialog(
-            content: Row(children: [
-              const CircularProgressIndicator(),
-              const SizedBox(width: 16),
-              Expanded(child: Text(v)),
-            ]),
-          ),
-        ),
-      );
-    }
+    // Instant import: no blocking dialog, no parsing here.
+    // Books appear in the library right away; content parses
+    // in the background. If a file cannot be read at all, it
+    // is counted as failed with a reason, never silently lost.
     var added = 0;
     var failed = 0;
     var firstError = '';
@@ -321,7 +305,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       final covers = await _coversDir();
       for (var i = 0; i < files.length; i++) {
         final f = files[i];
-        progress.value = 'Importing ${i + 1} of ${files.length}: ${f.name}';
         Uint8List bytes;
         try {
           bytes = await readPickedFile(f);
@@ -349,45 +332,81 @@ class _LibraryScreenState extends State<LibraryScreen> {
           }
           continue;
         }
-        final ok = await _storeBook(f.name, bytes, dir, covers, i);
-        if (ok) {
+        final ok = await _storeBookInstant(f.name, bytes, dir, covers, i);
+        if (ok != null) {
           added++;
         } else {
           failed++;
           if (firstError.isEmpty) {
-            firstError = 'Could not open ${f.name}';
+            firstError = 'Could not save ${f.name}';
           }
         }
       }
-    } finally {
-      if (mounted) Navigator.pop(context);
+    } catch (e) {
+      if (firstError.isEmpty) firstError = e.toString();
     }
     await _persist();
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text(failed == 0
-              ? 'Added $added book${added == 1 ? '' : 's'}'
+              ? 'Added $added book${added == 1 ? '' : 's'} — tap one to read, content loads in the background'
               : firstError.isEmpty
-                  ? 'Added $added, $failed could not be opened'
-                  : 'Added $added, $failed could not be opened. Reason: $firstError'),
+                  ? 'Added $added, $failed could not be saved'
+                  : 'Added $added, $failed could not be saved. Reason: $firstError'),
           duration: const Duration(seconds: 6)));
     }
   }
 
-  /// Stores one book: writes the file, parses it OFF the UI thread,
-  /// saves its cover, and puts it at the top of the library.
-  /// Returns true on success. Never throws.
-  Future<bool> _storeBook(String name, Uint8List bytes, Directory dir,
-      Directory covers, int index) async {
+  String _cleanTitle(String name) {
+    final base = name.split('/').last;
+    final dot = base.lastIndexOf('.');
+    final n = dot > 0 ? base.substring(0, dot) : base;
+    final cleaned = n.replaceAll(RegExp(r'[-_]+'), ' ').trim();
+    return cleaned.isEmpty ? 'Untitled Book' : cleaned;
+  }
+
+  /// INSTANT import: writes the file and shows the book in the
+  /// library immediately — no parsing, no waiting. Parsing runs
+  /// afterwards in a background isolate (see _parseInBackground).
+  /// This is what makes import take seconds, not minutes: the
+  /// old code parsed every book before showing anything, so one
+  /// big PDF froze the whole import. Returns the new book id.
+  Future<String?> _storeBookInstant(String name, Uint8List bytes,
+      Directory dir, Directory covers, int index) async {
     try {
-      final ext = name.split('.').last.toLowerCase();
-      final id =
-          'book-${DateTime.now().microsecondsSinceEpoch}-$index';
+      final ext = name.split('/').last.split('.').last.toLowerCase();
+      final id = 'book-${DateTime.now().microsecondsSinceEpoch}-$index';
       final file = File('${dir.path}/$id.$ext');
       await file.writeAsBytes(bytes);
+      final book = LibraryBook(
+        id: id,
+        title: _cleanTitle(name),
+        author: 'Unknown Author',
+        format: ext,
+        filePath: file.path,
+        chapters: const [],
+        addedAt: DateTime.now(),
+      );
+      if (mounted) {
+        setState(() => _books.insert(0, book));
+      } else {
+        _books.insert(0, book);
+      }
+      // Parse in the background, without blocking the UI.
+      // ignore: unawaited_futures
+      _parseInBackground(id, name, bytes, covers);
+      return id;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _parseInBackground(String id, String name, Uint8List bytes,
+      Directory covers) async {
+    try {
       final parsed = parsedBookFromIsolate(
         await compute(parseBookIsolate, {'name': name, 'bytes': bytes})
-            .timeout(const Duration(seconds: 90)),
+            .timeout(const Duration(seconds: 120)),
       );
       String? coverPath;
       if (parsed.coverBytes != null) {
@@ -395,27 +414,42 @@ class _LibraryScreenState extends State<LibraryScreen> {
         await cf.writeAsBytes(parsed.coverBytes!);
         coverPath = cf.path;
       }
-      if (!mounted) return true;
+      if (!mounted) return;
+      final i = _books.indexWhere((b) => b.id == id);
+      if (i < 0) return;
+      final old = _books[i];
       setState(() {
-        _books.insert(
-          0,
-          LibraryBook(
-            id: id,
-            title: parsed.title,
-            author: parsed.author,
-            format: parsed.format,
-            filePath: file.path,
-            coverPath: coverPath,
-            chapters: parsed.chapters,
-            addedAt: DateTime.now(),
-          ),
+        _books[i] = LibraryBook(
+          id: old.id,
+          title: parsed.title,
+          author: parsed.author,
+          format: parsed.format,
+          filePath: old.filePath,
+          coverPath: coverPath ?? old.coverPath,
+          chapters: parsed.chapters,
+          progress: old.progress,
+          lastChapter: old.lastChapter,
+          lastParagraph: old.lastParagraph,
+          bookmarks: old.bookmarks,
+          highlights: old.highlights,
+          shelf: old.shelf,
+          isFavourite: old.isFavourite,
+          tags: old.tags,
+          addedAt: old.addedAt,
         );
       });
-      return true;
+      await _persist();
     } catch (_) {
-      return false;
+      // Book stays in the library with its file name as title.
+      // Opening it retries the parse and shows the real reason
+      // if it fails again — the book is never silently lost.
     }
   }
+
+  // Kept for callers that still use the old name.
+  Future<bool> _storeBook(String name, Uint8List bytes, Directory dir,
+          Directory covers, int index) async =>
+      (await _storeBookInstant(name, bytes, dir, covers, index)) != null;
 
   /// "Find books on my phone" — the user picks ONE folder (for
   /// example Downloads or a Books folder) and InkBloom imports
@@ -457,23 +491,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       }
       return;
     }
-    final progress = ValueNotifier<String>('Found ${found.length} books…');
-    if (mounted) {
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => ValueListenableBuilder<String>(
-          valueListenable: progress,
-          builder: (_, v, __) => AlertDialog(
-            content: Row(children: [
-              const CircularProgressIndicator(),
-              const SizedBox(width: 16),
-              Expanded(child: Text(v)),
-            ]),
-          ),
-        ),
-      );
-    }
     var added = 0;
     var failed = 0;
     var firstError = '';
@@ -482,11 +499,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
       final covers = await _coversDir();
       for (var i = 0; i < found.length; i++) {
         final f = found[i];
-        progress.value =
-            'Importing ${i + 1} of ${found.length}: ${f.path.split('/').last}';
         try {
           final bytes = await f.readAsBytes();
-          if (await _storeBook(f.path.split('/').last, bytes, dir, covers, i)) {
+          if (await _storeBookInstant(
+                  f.path.split('/').last, bytes, dir, covers, i) !=
+              null) {
             added++;
           } else {
             failed++;
@@ -496,15 +513,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
           if (firstError.isEmpty) firstError = e.toString();
         }
       }
-    } finally {
-      if (mounted) Navigator.pop(context);
+    } catch (e) {
+      if (firstError.isEmpty) firstError = e.toString();
     }
     await _persist();
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text(failed == 0
-              ? 'Found and added $added book${added == 1 ? '' : 's'} from your phone'
-              : 'Added $added, $failed could not be opened${firstError.isEmpty ? '' : '. Reason: $firstError'}'),
+              ? 'Found and added $added book${added == 1 ? '' : 's'} from your phone — tap one to read'
+              : 'Added $added, $failed could not be saved${firstError.isEmpty ? '' : '. Reason: $firstError'}'),
           duration: const Duration(seconds: 6)));
     }
   }
@@ -549,13 +566,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
       );
       try {
         final name = book.filePath!.split('/').last;
-        final ParsedBook parsed;
-        if (name.toLowerCase().endsWith('.pdf')) {
-          parsed = await BookParser.parsePdfFile(File(book.filePath!), name);
-        } else {
-          final bytes = await File(book.filePath!).readAsBytes();
-          parsed = BookParser.parse(name, bytes);
-        }
+        final bytes = await File(book.filePath!).readAsBytes();
+        final parsed = parsedBookFromIsolate(
+          await compute(parseBookIsolate, {'name': name, 'bytes': bytes})
+              .timeout(const Duration(seconds: 120)),
+        );
         final withChapters = LibraryBook(
           id: book.id,
           title: parsed.title,
@@ -620,6 +635,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ),
     );
     if (updated != null) _updateBook(updated);
+    // Refresh stats: the reader records minutes while you read,
+    // but the library card was showing the old totals until the
+    // app restarted. Reload them the moment you come back.
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) {
+      setState(() {
+        _stats =
+            ReadingStats.fromJsonString(prefs.getString('inkbloom_stats'));
+      });
+    }
   }
 
   List<LibraryBook> get _visible {
@@ -748,6 +773,40 @@ class _LibraryScreenState extends State<LibraryScreen> {
               PopupMenuItem(value: 'support', child: Text('Support')),
             ],
           ),
+        ],
+      ),
+      bottomNavigationBar: BottomNavigationBar(
+        type: BottomNavigationBarType.fixed,
+        currentIndex: 0,
+        selectedItemColor: terracotta,
+        unselectedItemColor: forest,
+        onTap: (i) {
+          if (i == 1) {
+            _findBooksOnPhone();
+          } else if (i == 2) {
+            Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const DictionaryScreen()),
+            );
+          } else if (i == 3) {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) => StatsScreen(
+                      settings: _settings,
+                      stats: _stats,
+                      onSettingsChanged: _updateSettings)),
+            );
+          } else if (i == 4) {
+            _openSettings();
+          }
+        },
+        items: const [
+          BottomNavigationBarItem(icon: Icon(Icons.menu_book), label: 'Books'),
+          BottomNavigationBarItem(icon: Icon(Icons.search), label: 'Find'),
+          BottomNavigationBarItem(icon: Icon(Icons.book), label: 'Dictionary'),
+          BottomNavigationBarItem(icon: Icon(Icons.bar_chart), label: 'Goals'),
+          BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Settings'),
         ],
       ),
       floatingActionButton: Column(
@@ -1132,7 +1191,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                       : 4;
                               return GridView.builder(
                                 padding: const EdgeInsets.fromLTRB(
-                                    16, 8, 16, 110),
+                                    16, 8, 16, 180),
                                 gridDelegate:
                                     SliverGridDelegateWithFixedCrossAxisCount(
                                   crossAxisCount: cols,
@@ -1148,7 +1207,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                           )
                         : ListView.builder(
                             padding:
-                                const EdgeInsets.fromLTRB(16, 8, 16, 110),
+                                const EdgeInsets.fromLTRB(16, 8, 16, 180),
                             itemCount: _visible.length,
                             itemBuilder: (_, i) =>
                                 _listCard(_visible[i]),
@@ -1400,7 +1459,20 @@ class AppSettingsScreen extends StatelessWidget {
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
           const SizedBox(height: 4),
           const Text(
-              'These are the defaults for every book. You can still change them inside any book.'),
+              'These are the defaults for every book. You can still change them inside any book. Every switch and button here actually works and saves.'),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) => ReaderPreferencesScreen(
+                      settings: settings,
+                      onSettingsChanged: onSettingsChanged)),
+            ),
+            icon: const Icon(Icons.tune),
+            label: const Text(
+                'Reader preferences — text, theme, voice, navigation'),
+          ),
           const SizedBox(height: 12),
           _switchTile('Show top bar', settings.showTopBar,
               (v) => onSettingsChanged(settings.copyWith(showTopBar: v))),
@@ -1581,8 +1653,49 @@ class AppSettingsScreen extends StatelessWidget {
               ListTile(
                 title: Text(
                     'Night from ${settings.nightStartHour}:00 to ${settings.nightEndHour}:00'),
-                subtitle: const Text(
-                    'Change the hours inside any book: Text & theme → Auto night theme.'),
+                subtitle: const Text('Use the sliders below to change the hours.'),
+              ),
+              _sliderTile('Night starts (hour)',
+                  settings.nightStartHour.toDouble(), 0, 23,
+                  (v) => onSettingsChanged(
+                      settings.copyWith(nightStartHour: v.round()))),
+              _sliderTile('Night ends (hour)',
+                  settings.nightEndHour.toDouble(), 0, 23,
+                  (v) => onSettingsChanged(
+                      settings.copyWith(nightEndHour: v.round()))),
+              const Padding(
+                padding: EdgeInsets.all(8),
+                child: Text('Colour themes — tap one to use it',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: readerThemes.asMap().entries.map((e) {
+                  final sel = settings.themeIndex == e.key;
+                  return GestureDetector(
+                    onTap: () => onSettingsChanged(
+                        settings.copyWith(themeIndex: e.key)),
+                    child: Container(
+                      width: 64,
+                      height: 48,
+                      decoration: BoxDecoration(
+                        color: e.value.bg,
+                        border: Border.all(
+                          color: sel ? terracotta : Colors.grey,
+                          width: sel ? 3 : 1,
+                        ),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Center(
+                        child: Text(e.value.name.split(' ').first,
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                                color: e.value.fg, fontSize: 10)),
+                      ),
+                    ),
+                  );
+                }).toList(),
               ),
             ],
           ),
@@ -1592,30 +1705,96 @@ class AppSettingsScreen extends StatelessWidget {
               ListTile(
                 title: Text(
                     'Speech speed ${settings.ttsRate.toStringAsFixed(1)}× • pitch ${settings.ttsPitch.toStringAsFixed(1)}'),
-                subtitle: const Text(
-                    'Change speed and pitch inside any book: Text & theme → Read aloud. Tap the speaker icon to play.'),
+                subtitle: Text(settings.ttsVoiceName.isEmpty
+                    ? 'Voice: device default'
+                    : 'Voice: ${settings.ttsVoiceName}'),
+              ),
+              _sliderTile('Speech speed', settings.ttsRate, 0.5, 1.5,
+                  (v) => onSettingsChanged(settings.copyWith(ttsRate: v))),
+              _sliderTile('Speech pitch', settings.ttsPitch, 0.5, 2.0,
+                  (v) => onSettingsChanged(settings.copyWith(ttsPitch: v))),
+              TextButton.icon(
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (_) => ReaderPreferencesScreen(
+                          settings: settings,
+                          onSettingsChanged: onSettingsChanged)),
+                ),
+                icon: const Icon(Icons.record_voice_over),
+                label: const Text('Choose a voice & test it'),
               ),
             ],
           ),
           ExpansionTile(
             title: const Text('Stats & goals'),
             children: [
-              ListTile(
-                title: Text('Daily goal: ${settings.goalMinutes} minutes'),
-                subtitle: const Text(
-                    'Change it from the stats card on the library screen. Streaks and totals are local only.'),
+              _sliderTile('Daily goal (minutes)',
+                  settings.goalMinutes.toDouble(), 5, 120,
+                  (v) => onSettingsChanged(
+                      settings.copyWith(goalMinutes: v.round()))),
+              TextButton.icon(
+                onPressed: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (_) => StatsScreen(
+                          settings: settings,
+                          stats: ReadingStats.fromJsonString(statsJson),
+                          onSettingsChanged: onSettingsChanged)),
+                ),
+                icon: const Icon(Icons.bar_chart),
+                label: const Text('Open goals & stats screen'),
+              ),
+              const ListTile(
+                subtitle: Text('Streaks and totals are local only.'),
               ),
             ],
           ),
           ExpansionTile(
             title: const Text('Fonts'),
             children: [
-              ListTile(
-                title: Text(settings.customFonts.isEmpty
-                    ? 'No custom fonts yet'
-                    : 'Custom fonts: ${settings.customFonts.join(', ')}'),
-                subtitle: const Text(
-                    'Import a .ttf/.otf inside any book: Text & theme → Import your own font.'),
+              Wrap(
+                spacing: 8,
+                children: ['Serif', 'Sans', 'Mono'].asMap().entries.map((e) {
+                  final sel = settings.fontIndex == e.key;
+                  return ChoiceChip(
+                    label: Text(e.value),
+                    selected: sel,
+                    onSelected: (_) => onSettingsChanged(
+                        settings.copyWith(fontIndex: e.key)),
+                  );
+                }).toList(),
+              ),
+              Wrap(
+                spacing: 8,
+                children: settings.customFonts.asMap().entries.map((e) {
+                  final sel = settings.fontIndex == 3 + e.key;
+                  return ChoiceChip(
+                    label: Text(e.value),
+                    selected: sel,
+                    onSelected: (_) => onSettingsChanged(
+                        settings.copyWith(fontIndex: 3 + e.key)),
+                  );
+                }).toList(),
+              ),
+              TextButton.icon(
+                onPressed: () async {
+                  final picked = await FilePicker.pickFile(
+                    type: FileType.custom,
+                    allowedExtensions: ['ttf', 'otf'],
+                  );
+                  if (picked == null) return;
+                  final family = await CustomFonts.importFont(
+                      picked.name, await readPickedFile(picked));
+                  if (family == null) return;
+                  final fonts = [...settings.customFonts];
+                  if (!fonts.contains(family)) fonts.add(family);
+                  onSettingsChanged(settings.copyWith(
+                      customFonts: fonts,
+                      fontIndex: 3 + fonts.indexOf(family)));
+                },
+                icon: const Icon(Icons.font_download),
+                label: const Text('Import your own font (.ttf / .otf)'),
               ),
             ],
           ),
@@ -1666,6 +1845,19 @@ class AppSettingsScreen extends StatelessWidget {
       onChanged: onChanged,
     );
   }
+
+  Widget _sliderTile(String label, double value, double min, double max,
+      ValueChanged<double> onChanged) {
+    return Row(children: [
+      SizedBox(width: 150, child: Text(label)),
+      Expanded(
+        child: Slider(value: value, min: min, max: max, onChanged: onChanged),
+      ),
+      SizedBox(
+          width: 44,
+          child: Text(value.toStringAsFixed(value < 10 ? 1 : 0))),
+    ]);
+  }
 }
 
 // ── Reader ──────────────────────────────────────────────────────────────
@@ -1692,8 +1884,14 @@ class _ReaderScreenState extends State<ReaderScreen> {
   late bool _barsVisible;
   late bool _locked;
   String _searchTerm = '';
+  List<SearchHit> _searchHits = [];
+  int _searchHitIndex = 0;
+  final Map<int, GlobalKey> _paraKeys = {};
+  bool _showLockNotice = false;
+  Timer? _lockTimer;
   final _scroll = ScrollController();
   final _pageController = PageController();
+  final _scaffoldKey = GlobalKey<ScaffoldState>();
   final _tts = FlutterTts();
   bool _isSpeaking = false;
   DateTime _lastTick = DateTime.now();
@@ -1750,7 +1948,14 @@ class _ReaderScreenState extends State<ReaderScreen> {
   Future<void> _speakChapter() async {
     await _tts.setSpeechRate(_s.ttsRate);
     await _tts.setPitch(_s.ttsPitch);
-    await _tts.setLanguage('en-US');
+    if (_s.ttsVoiceName.isNotEmpty) {
+      await _tts.setVoice({
+        'name': _s.ttsVoiceName,
+        'locale': _s.ttsVoiceLocale.isEmpty ? 'en-US' : _s.ttsVoiceLocale,
+      });
+    } else {
+      await _tts.setLanguage('en-US');
+    }
     final text = widget.book.chapters[_chapter].paragraphs.join(' ');
     final result = await _tts.speak(text);
     if (mounted) setState(() => _isSpeaking = result == 1);
@@ -1764,6 +1969,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void dispose() {
     _statsTimer?.cancel();
+    _lockTimer?.cancel();
     _recordReadingTime();
     _tts.stop();
     _scroll.dispose();
@@ -1772,8 +1978,41 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   void _setSettings(ReaderSettings s) {
+    final voiceChanged = s.ttsRate != _s.ttsRate ||
+        s.ttsPitch != _s.ttsPitch ||
+        s.ttsVoiceName != _s.ttsVoiceName ||
+        s.ttsVoiceLocale != _s.ttsVoiceLocale;
     setState(() => _s = s);
     widget.onSettingsChanged(s);
+    if (voiceChanged && _isSpeaking) {
+      // Apply the new voice/speed right away, not on the next chapter.
+      _stopTts().then((_) => _speakChapter());
+    }
+  }
+
+  void _setLocked(bool v) {
+    setState(() {
+      _locked = v;
+      _showLockNotice = true;
+    });
+    _lockTimer?.cancel();
+    _lockTimer = Timer(const Duration(milliseconds: 1600), () {
+      if (mounted) setState(() => _showLockNotice = false);
+    });
+  }
+
+  void _jumpToHit(int idx) {
+    if (_searchHits.isEmpty) return;
+    final hit = _searchHits[idx.clamp(0, _searchHits.length - 1)];
+    setState(() {
+      _searchHitIndex = idx.clamp(0, _searchHits.length - 1);
+      _chapter = hit.chapter;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final key = _paraKeys[hit.paragraph];
+      final ctx = key?.currentContext;
+      if (ctx != null) Scrollable.ensureVisible(ctx, duration: const Duration(milliseconds: 300));
+    });
   }
 
   void _guarded(VoidCallback action) {
@@ -1862,9 +2101,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
         ),
       );
     }
-    return GestureDetector(
-      onLongPress: () =>
-          _guarded(() => _highlightSheet(chapterIdx, paraIdx, hl, text)),
+    return KeyedSubtree(
+      key: _paraKeys.putIfAbsent(paraIdx, () => GlobalKey()),
+      child: GestureDetector(
+      onLongPress: _s.enableHighlights
+          ? () => _guarded(() => _highlightSheet(chapterIdx, paraIdx, hl, text))
+          : null,
       child: Container(
         width: double.infinity,
         color: hl != null
@@ -1897,6 +2139,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
           ],
         ),
       ),
+    ),
     );
   }
 
@@ -2060,15 +2303,14 @@ class _ReaderScreenState extends State<ReaderScreen> {
                     subtitle: Text(
                         '${widget.book.chapters[h.chapter].title} • paragraph ${h.paragraph + 1}'),
                     onTap: () {
-                      setState(() {
-                        _searchTerm = controller.text;
-                        _chapter = h.chapter;
-                                          });
+                      final term = controller.text;
                       Navigator.pop(context);
-                      ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                              content: Text(
-                                  'Matches are highlighted in this chapter')));
+                      setState(() {
+                        _searchTerm = term;
+                        _searchHits = searchBook(widget.book, term);
+                        _searchHitIndex = i;
+                      });
+                      _jumpToHit(i);
                     },
                   );
                 },
@@ -2248,6 +2490,40 @@ class _ReaderScreenState extends State<ReaderScreen> {
   Widget build(BuildContext context) {
     final theme = _s.effectiveTheme;
     final showBars = _barsVisible;
+    if (widget.book.chapters.isEmpty) {
+      // Never a blank/black page: a book with no content yet gets
+      // a clear message and a way back, instead of an empty screen.
+      return Scaffold(
+        appBar: AppBar(
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.pop(context),
+          ),
+          title: Text(widget.book.title),
+        ),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              const Icon(Icons.menu_book, size: 64, color: forest),
+              const SizedBox(height: 16),
+              const Text('This book is not ready yet',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                  textAlign: TextAlign.center),
+              const SizedBox(height: 8),
+              const Text(
+                  'Its content is still loading in the background, or it could not be read. Go back and tap the book again — opening it will try again and tell you the real reason if it fails.',
+                  textAlign: TextAlign.center),
+              const SizedBox(height: 20),
+              FilledButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Back to my books'),
+              ),
+            ]),
+          ),
+        ),
+      );
+    }
     final appBar = AppBar(
       backgroundColor: forest,
       leading: IconButton(
@@ -2258,51 +2534,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
           style: const TextStyle(fontSize: 16),
           overflow: TextOverflow.ellipsis),
       actions: [
-        if (_s.showTocButton)
-          Builder(
-            builder: (btnContext) => IconButton(
-              icon: const Icon(Icons.list),
-              onPressed: () => _guarded(
-                  () => Scaffold.of(btnContext).openDrawer()),
-              tooltip: 'Chapters',
-            ),
-          ),
         if (_s.showSearchButton)
           IconButton(
             icon: const Icon(Icons.search),
             onPressed: () => _guarded(_searchSheet),
             tooltip: 'Search in book',
           ),
-        IconButton(
-          icon: const Icon(Icons.highlight),
-          onPressed: () => _guarded(_notesSheet),
-          tooltip: 'Highlights & notes',
-        ),
-        if (_s.showBookmarkButton)
-          IconButton(
-            icon: Icon(_bookmarks.contains(_chapter)
-                ? Icons.bookmark
-                : Icons.bookmark_border),
-            onPressed: () => _guarded(() {
-              setState(() {
-                if (_bookmarks.contains(_chapter)) {
-                  _bookmarks.remove(_chapter);
-                } else {
-                  _bookmarks.add(_chapter);
-                }
-              });
-            }),
-            tooltip: 'Bookmark chapter',
-          ),
-        IconButton(
-          icon: Icon(_locked ? Icons.lock : Icons.lock_open),
-          onPressed: () {
-            if (_s.doubleTapLockEnabled) {
-              setState(() => _locked = !_locked);
-            }
-          },
-          tooltip: 'Lock / unlock',
-        ),
         IconButton(
           icon: Icon(_isSpeaking ? Icons.stop : Icons.volume_up),
           onPressed: () => _guarded(() {
@@ -2314,10 +2551,49 @@ class _ReaderScreenState extends State<ReaderScreen> {
           }),
           tooltip: 'Read aloud',
         ),
+        // ONE clear settings icon (tune), not a text-size icon:
+        // this opens text, theme, voice, navigation — everything.
         IconButton(
-          icon: const Icon(Icons.text_fields),
+          icon: const Icon(Icons.tune),
           onPressed: () => _guarded(_settingsSheet),
-          tooltip: 'Text, theme & navigation',
+          tooltip: 'Reading settings — text, theme, voice, navigation',
+        ),
+        PopupMenuButton<String>(
+          icon: const Icon(Icons.more_vert),
+          tooltip: 'More',
+          onSelected: (v) {
+            if (v == 'chapters') {
+              _guarded(() => _scaffoldKey.currentState?.openDrawer());
+            } else if (v == 'notes') {
+              _guarded(_notesSheet);
+            } else if (v == 'bookmark') {
+              _guarded(() {
+                setState(() {
+                  if (_bookmarks.contains(_chapter)) {
+                    _bookmarks.remove(_chapter);
+                  } else {
+                    _bookmarks.add(_chapter);
+                  }
+                });
+              });
+            } else if (v == 'lock') {
+              if (_s.doubleTapLockEnabled) _setLocked(!_locked);
+            }
+          },
+          itemBuilder: (_) => [
+            if (_s.showTocButton)
+              const PopupMenuItem(value: 'chapters', child: Text('Chapters')),
+            const PopupMenuItem(
+                value: 'notes', child: Text('Highlights & notes')),
+            PopupMenuItem(
+                value: 'bookmark',
+                child: Text(_bookmarks.contains(_chapter)
+                    ? 'Remove bookmark'
+                    : 'Bookmark this chapter')),
+            PopupMenuItem(
+                value: 'lock',
+                child: Text(_locked ? 'Unlock page' : 'Lock page')),
+          ],
         ),
       ],
     );
@@ -2325,6 +2601,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     // open it in a Builder below; the list button above is replaced
     // by using a Builder in the body instead — see _drawerButton.
     return Scaffold(
+      key: _scaffoldKey,
       backgroundColor: theme.bg,
       appBar: (_s.showTopBar && showBars) ? appBar : null,
       drawer: Drawer(
@@ -2376,11 +2653,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
         ]),
       ),
       floatingActionButton:
-          (!_s.showTopBar || !_s.showBottomBar || !showBars)
-              ? FloatingActionButton.small(
+          (!showBars || !_s.showTopBar || !_s.showBottomBar)
+              ? FloatingActionButton.extended(
                   onPressed: () => setState(() => _barsVisible = true),
-                  tooltip: 'Show navigation',
-                  child: const Icon(Icons.menu),
+                  icon: const Icon(Icons.tune),
+                  label: const Text('Controls'),
+                  tooltip: 'Show reading controls',
                 )
               : null,
       bottomNavigationBar:
@@ -2390,7 +2668,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
       body: Builder(
         builder: (scaffoldContext) => GestureDetector(
           onDoubleTap: _s.doubleTapLockEnabled
-              ? () => setState(() => _locked = !_locked)
+              ? () => _setLocked(!_locked)
               : null,
           onTap: _s.autoHideBars
               ? () => setState(() => _barsVisible = !_barsVisible)
@@ -2399,21 +2677,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
             Column(children: [
               if (_s.showBottomBar && showBars && _s.navPosition == 1)
                 _chapterBar(),
-              if (_locked)
-                Container(
-                  width: double.infinity,
-                  color: terracotta,
-                  padding: const EdgeInsets.symmetric(vertical: 6),
-                  child: const Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(Icons.lock, size: 16, color: Colors.white),
-                      SizedBox(width: 6),
-                      Text('Locked — double-tap the page to unlock',
-                          style: TextStyle(color: Colors.white)),
-                    ],
-                  ),
-                ),
               if (_isSpeaking)
                 Container(
                   width: double.infinity,
@@ -2439,13 +2702,40 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   width: double.infinity,
                   color: theme.accent.withValues(alpha: 0.25),
                   padding: const EdgeInsets.symmetric(
-                      vertical: 6, horizontal: 12),
+                      vertical: 2, horizontal: 8),
                   child: Row(children: [
                     Expanded(
-                        child: Text('Searching: "$_searchTerm"',
-                            style: TextStyle(color: theme.fg))),
+                        child: Text(
+                            '"$_searchTerm" — ${_searchHitIndex + 1} of ${_searchHits.length} matches',
+                            style: TextStyle(color: theme.fg),
+                            overflow: TextOverflow.ellipsis)),
+                    IconButton(
+                      icon: const Icon(Icons.chevron_left),
+                      color: theme.fg,
+                      tooltip: 'Previous match',
+                      onPressed: _searchHits.isEmpty
+                          ? null
+                          : () => _jumpToHit(_searchHitIndex - 1),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.chevron_right),
+                      color: theme.fg,
+                      tooltip: 'Next match',
+                      onPressed: _searchHits.isEmpty
+                          ? null
+                          : () => _jumpToHit(_searchHitIndex + 1),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.list),
+                      color: theme.fg,
+                      tooltip: 'All matches',
+                      onPressed: () => _guarded(_searchSheet),
+                    ),
                     TextButton(
-                      onPressed: () => setState(() => _searchTerm = ''),
+                      onPressed: () => setState(() {
+                        _searchTerm = '';
+                        _searchHits = [];
+                      }),
                       child: const Text('Clear'),
                     ),
                   ]),
@@ -2462,6 +2752,58 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(24)),
                   child: _chapterBar(),
+                ),
+              ),
+            if (_showLockNotice)
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 20, vertical: 12),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.8),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(_locked ? Icons.lock : Icons.lock_open,
+                        color: Colors.white),
+                    const SizedBox(width: 8),
+                    Text(_locked ? 'Locked' : 'Unlocked',
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold)),
+                  ]),
+                ),
+              ),
+            // Text size - / + buttons: hideable in Reader preferences.
+            if (_s.showTextSizeButtons && showBars)
+              Positioned(
+                right: 16,
+                bottom: (_s.showBottomBar && _s.navPosition == 0)
+                    ? 88
+                    : 16,
+                child: Card(
+                  elevation: 4,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(24)),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    IconButton(
+                      icon: const Icon(Icons.remove),
+                      tooltip: 'Smaller text',
+                      onPressed: () => _guarded(() => _setSettings(
+                          _s.copyWith(
+                              fontSize: (_s.fontSize - 1).clamp(12.0, 32.0)))),
+                    ),
+                    Text('${_s.fontSize.round()}',
+                        style: const TextStyle(fontWeight: FontWeight.bold)),
+                    IconButton(
+                      icon: const Icon(Icons.add),
+                      tooltip: 'Bigger text',
+                      onPressed: () => _guarded(() => _setSettings(
+                          _s.copyWith(
+                              fontSize: (_s.fontSize + 1).clamp(12.0, 32.0)))),
+                    ),
+                  ]),
                 ),
               ),
             // Edge tap zones, when enabled: left edge = previous
@@ -2491,19 +2833,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 ),
               ),
             ],
-            // Chapter-list button when the top bar is hidden: the
-            // Scaffold drawer still needs a context, provided here.
-            if (!_s.showTopBar || !showBars)
-              Positioned(
-                top: 12,
-                left: 12,
-                child: FloatingActionButton.small(
-                  heroTag: 'toc',
-                  onPressed: () => _guarded(
-                      () => Scaffold.of(scaffoldContext).openDrawer()),
-                  child: const Icon(Icons.list),
-                ),
-              ),
           ]),
         ),
       ),
@@ -2531,6 +2860,25 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 const Text('Text, theme & navigation',
                     style:
                         TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+                const SizedBox(height: 8),
+                FilledButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context);
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (_) => ReaderPreferencesScreen(
+                              settings: _s,
+                              onSettingsChanged: _setSettings)),
+                    );
+                  },
+                  icon: const Icon(Icons.tune),
+                  label: const Text(
+                      'Open full Reader preferences — voices, navigation, everything'),
+                ),
+                const Text(
+                    'Everything here also lives on the Reader preferences page, and applies to all books.',
+                    style: TextStyle(color: Colors.grey)),
                 const SizedBox(height: 16),
                 _sliderRow('Text size', _s.fontSize, 12, 32,
                     (v) => update(_s.copyWith(fontSize: v))),
@@ -2653,18 +3001,21 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 Wrap(
                   spacing: 8,
                   children: [
-                    'Continuous scroll',
-                    'Paged swipe',
-                    'Scroll (simple)',
+                    'Scroll (top to bottom)',
+                    'Paged swipe (left / right)',
                   ].asMap().entries.map((e) {
                     final sel = _s.readingMode == e.key;
                     return ChoiceChip(
                       label: Text(e.value),
                       selected: sel,
-                      onSelected: (_) => update(
-                          _s.copyWith(readingMode: e.key == 2 ? 0 : e.key)),
+                      onSelected: (_) =>
+                          update(_s.copyWith(readingMode: e.key)),
                     );
                   }).toList(),
+                ),
+                const Text(
+                  'Scroll means the page moves up and down with your finger. Paged swipe means pages turn left and right. Pick one — the other one will not happen.',
+                  style: TextStyle(color: Colors.grey),
                 ),
                 const SizedBox(height: 12),
                 const Text('Colour themes — 12',
@@ -2699,6 +3050,35 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   }).toList(),
                 ),
                 const SizedBox(height: 16),
+                const Text('Text size buttons', style: TextStyle(fontWeight: FontWeight.bold)),
+                SwitchListTile(
+                    title: const Text('Show - / + text size buttons while reading'),
+                    value: _s.showTextSizeButtons,
+                    onChanged: (v) =>
+                        update(_s.copyWith(showTextSizeButtons: v))),
+                Row(children: [
+                  IconButton(
+                    icon: const Icon(Icons.remove),
+                    onPressed: () => update(_s.copyWith(
+                        fontSize: (_s.fontSize - 1).clamp(12.0, 32.0))),
+                  ),
+                  Text('Text size ${_s.fontSize.round()}',
+                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                  IconButton(
+                    icon: const Icon(Icons.add),
+                    onPressed: () => update(_s.copyWith(
+                        fontSize: (_s.fontSize + 1).clamp(12.0, 32.0))),
+                  ),
+                ]),
+                const Text('Highlights', style: TextStyle(fontWeight: FontWeight.bold)),
+                SwitchListTile(
+                    title: const Text('Highlights: long-press a paragraph to highlight it in colour and add a note'),
+                    subtitle: const Text('Turn off if you do not want highlights at all — long-press will do nothing.'),
+                    value: _s.enableHighlights,
+                    onChanged: (v) =>
+                        update(_s.copyWith(enableHighlights: v))),
+                const Text('These settings apply to all books, not just this one.',
+                    style: TextStyle(color: Colors.grey)),
                 const Text('Navigation — set it up your way',
                     style: TextStyle(fontWeight: FontWeight.bold)),
                 SwitchListTile(
@@ -2789,5 +3169,452 @@ class _ReaderScreenState extends State<ReaderScreen> {
           width: 44,
           child: Text(value.toStringAsFixed(value < 10 ? 1 : 0))),
     ]);
+  }
+}
+
+// ── Reader Preferences — one page for EVERYTHING ──────────────────────
+// The user asked for this explicitly: a Reader Preferences page where
+// every reader setting lives, works, and applies to all books.
+// It is reachable from Settings, from the reader's tune (⚙) sheet,
+// and from the library. Every control here actually changes the
+// setting and saves it (ReaderSettings.toJson now saves all fields).
+class ReaderPreferencesScreen extends StatefulWidget {
+  final ReaderSettings settings;
+  final ValueChanged<ReaderSettings> onSettingsChanged;
+  const ReaderPreferencesScreen(
+      {super.key, required this.settings, required this.onSettingsChanged});
+  @override
+  State<ReaderPreferencesScreen> createState() =>
+      _ReaderPreferencesScreenState();
+}
+
+class _ReaderPreferencesScreenState extends State<ReaderPreferencesScreen> {
+  late ReaderSettings _s;
+  final _tts = FlutterTts();
+  List<Map<String, String>> _voices = [];
+  bool _testing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _s = widget.settings;
+    _loadVoices();
+  }
+
+  @override
+  void dispose() {
+    _tts.stop();
+    super.dispose();
+  }
+
+  Future<void> _loadVoices() async {
+    try {
+      final raw = await _tts.getVoices;
+      final list = <Map<String, String>>[];
+      for (final v in (raw as List? ?? [])) {
+        if (v is Map) {
+          list.add({
+            'name': (v['name'] ?? '').toString(),
+            'locale': (v['locale'] ?? '').toString(),
+          });
+        }
+      }
+      list.removeWhere((v) => v['name']!.isEmpty);
+      list.sort((a, b) => (a['locale']! + a['name']!)
+          .compareTo(b['locale']! + b['name']!));
+      if (mounted) setState(() => _voices = list);
+    } catch (_) {}
+  }
+
+  void _update(ReaderSettings s) {
+    setState(() => _s = s);
+    widget.onSettingsChanged(s);
+  }
+
+  Future<void> _testVoice() async {
+    if (_testing) {
+      await _tts.stop();
+      if (mounted) setState(() => _testing = false);
+      return;
+    }
+    await _tts.setSpeechRate(_s.ttsRate);
+    await _tts.setPitch(_s.ttsPitch);
+    if (_s.ttsVoiceName.isNotEmpty) {
+      await _tts.setVoice({
+        'name': _s.ttsVoiceName,
+        'locale': _s.ttsVoiceLocale.isEmpty ? 'en-US' : _s.ttsVoiceLocale,
+      });
+    } else {
+      await _tts.setLanguage('en-US');
+    }
+    await _tts.speak('Hello, this is InkBloom Reader. How does this voice sound?');
+    if (mounted) setState(() => _testing = true);
+    _tts.setCompletionHandler(() {
+      if (mounted) setState(() => _testing = false);
+    });
+  }
+
+  Widget _slider(String label, double value, double min, double max,
+      ValueChanged<double> onChanged) {
+    return Row(children: [
+      SizedBox(width: 130, child: Text(label)),
+      Expanded(
+        child: Slider(
+            value: value, min: min, max: max, onChanged: onChanged),
+      ),
+      SizedBox(
+          width: 44,
+          child: Text(value.toStringAsFixed(value < 10 ? 1 : 0))),
+    ]);
+  }
+
+  Widget _switch(String title, String? subtitle, bool value,
+      ValueChanged<bool> onChanged) {
+    return SwitchListTile(
+        title: Text(title),
+        subtitle: subtitle == null ? null : Text(subtitle),
+        value: value,
+        onChanged: onChanged);
+  }
+
+  Widget _heading(String text) => Padding(
+        padding: const EdgeInsets.only(top: 20, bottom: 4),
+        child: Text(text,
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Reader preferences')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        const Text(
+            'These settings apply to ALL books, not just one. Change them here, or inside any book with the tune icon — it is the same setting, saved everywhere.'),
+        _heading('Text size — with + and -'),
+        Row(children: [
+          IconButton(
+            icon: const Icon(Icons.remove),
+            onPressed: () => _update(
+                _s.copyWith(fontSize: (_s.fontSize - 1).clamp(12.0, 32.0))),
+          ),
+          Text('Size ${_s.fontSize.round()}',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+          IconButton(
+            icon: const Icon(Icons.add),
+            onPressed: () => _update(
+                _s.copyWith(fontSize: (_s.fontSize + 1).clamp(12.0, 32.0))),
+          ),
+          const Expanded(
+              child: Text('Tap - / + any time while reading, too.')),
+        ]),
+        _switch('Show - / + buttons while reading',
+            'Turn off to hide the size buttons in the reader.',
+            _s.showTextSizeButtons,
+            (v) => _update(_s.copyWith(showTextSizeButtons: v))),
+        _slider('Text size', _s.fontSize, 12, 32,
+            (v) => _update(_s.copyWith(fontSize: v))),
+        _slider('Line height', _s.lineHeight, 1.2, 2.2,
+            (v) => _update(_s.copyWith(lineHeight: v))),
+        _slider('Letter spacing', _s.letterSpacing, 0, 3,
+            (v) => _update(_s.copyWith(letterSpacing: v))),
+        _slider('Paragraph spacing', _s.paragraphSpacing, 4, 32,
+            (v) => _update(_s.copyWith(paragraphSpacing: v))),
+        _slider('Page margin', _s.pageMargin, 12, 40,
+            (v) => _update(_s.copyWith(pageMargin: v))),
+        _heading('Font'),
+        Wrap(
+          spacing: 8,
+          children: ['Serif', 'Sans', 'Mono'].asMap().entries.map((e) {
+            final sel = _s.fontIndex == e.key;
+            return ChoiceChip(
+              label: Text(e.value),
+              selected: sel,
+              onSelected: (_) => _update(_s.copyWith(fontIndex: e.key)),
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 8),
+        const Text('Your imported fonts',
+            style: TextStyle(fontWeight: FontWeight.bold)),
+        Wrap(
+          spacing: 8,
+          children: _s.customFonts.asMap().entries.map((e) {
+            final sel = _s.fontIndex == 3 + e.key;
+            return ChoiceChip(
+              label: Text(e.value),
+              selected: sel,
+              onSelected: (_) =>
+                  _update(_s.copyWith(fontIndex: 3 + e.key)),
+            );
+          }).toList(),
+        ),
+        TextButton.icon(
+          onPressed: () async {
+            final picked = await FilePicker.pickFile(
+              type: FileType.custom,
+              allowedExtensions: ['ttf', 'otf'],
+            );
+            if (picked == null) return;
+            final family = await CustomFonts.importFont(
+                picked.name, await readPickedFile(picked));
+            if (family == null) return;
+            final fonts = [..._s.customFonts];
+            if (!fonts.contains(family)) fonts.add(family);
+            _update(_s.copyWith(
+                customFonts: fonts, fontIndex: 3 + fonts.indexOf(family)));
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Font "$family" imported')));
+            }
+          },
+          icon: const Icon(Icons.font_download),
+          label: const Text('Import your own font (.ttf / .otf)'),
+        ),
+        _heading('Colour themes & night'),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: readerThemes.asMap().entries.map((e) {
+            final sel = _s.themeIndex == e.key;
+            return GestureDetector(
+              onTap: () => _update(_s.copyWith(themeIndex: e.key)),
+              child: Container(
+                width: 64,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: e.value.bg,
+                  border: Border.all(
+                    color: sel ? terracotta : Colors.grey,
+                    width: sel ? 3 : 1,
+                  ),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Center(
+                  child: Text(e.value.name.split(' ').first,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: e.value.fg, fontSize: 10)),
+                ),
+              ),
+            );
+          }).toList(),
+        ),
+        _switch('Auto night theme by time of day',
+            'Switches to the Midnight (dark) theme at night, back in the morning.',
+            _s.autoNight, (v) => _update(_s.copyWith(autoNight: v))),
+        _slider('Night starts (hour)', _s.nightStartHour.toDouble(), 0, 23,
+            (v) => _update(_s.copyWith(nightStartHour: v.round()))),
+        _slider('Night ends (hour)', _s.nightEndHour.toDouble(), 0, 23,
+            (v) => _update(_s.copyWith(nightEndHour: v.round()))),
+        _heading('Read aloud — voices & speed'),
+        const Text(
+            'Pick a voice below, then tap Test to hear it. The voice you pick is used in every book, and you can change it any time — while reading, or here. No robotic default is forced on you.'),
+        if (_voices.isEmpty)
+          const Text('Loading voices from your phone…')
+        else
+          DropdownButton<String>(
+            isExpanded: true,
+            value: _s.ttsVoiceName.isEmpty ? null : _s.ttsVoiceName,
+            hint: const Text('Device default voice'),
+            items: [
+              const DropdownMenuItem<String>(
+                  value: null, child: Text('Device default voice')),
+              ..._voices.map((v) => DropdownMenuItem<String>(
+                    value: v['name'],
+                    child: Text('${v['name']} (${v['locale']})'),
+                  )),
+            ],
+            onChanged: (name) {
+              if (name == null) {
+                _update(_s.copyWith(ttsVoiceName: '', ttsVoiceLocale: ''));
+              } else {
+                final v =
+                    _voices.firstWhere((e) => e['name'] == name);
+                _update(_s.copyWith(
+                    ttsVoiceName: name, ttsVoiceLocale: v['locale'] ?? ''));
+              }
+            },
+          ),
+        Row(children: [
+          FilledButton.icon(
+            onPressed: _testVoice,
+            icon: Icon(_testing ? Icons.stop : Icons.play_arrow),
+            label: Text(_testing ? 'Stop test' : 'Test this voice'),
+          ),
+          const SizedBox(width: 12),
+          const Expanded(
+              child: Text('Speed is saved and locked for all books until you change it.')),
+        ]),
+        _slider('Speech speed', _s.ttsRate, 0.5, 1.5,
+            (v) => _update(_s.copyWith(ttsRate: v))),
+        _slider('Speech pitch', _s.ttsPitch, 0.5, 2.0,
+            (v) => _update(_s.copyWith(ttsPitch: v))),
+        _heading('How the book moves'),
+        Wrap(
+          spacing: 8,
+          children: [
+            'Scroll (top to bottom)',
+            'Paged swipe (left / right)',
+          ].asMap().entries.map((e) {
+            final sel = _s.readingMode == e.key;
+            return ChoiceChip(
+              label: Text(e.value),
+              selected: sel,
+              onSelected: (_) => _update(_s.copyWith(readingMode: e.key)),
+            );
+          }).toList(),
+        ),
+        const Text(
+            'Scroll means the page moves up and down with your finger. Paged swipe means pages turn left and right. Pick one — the other one will not happen.',
+            style: TextStyle(color: Colors.grey)),
+        _heading('Navigation — set it up your way'),
+        _switch('Show top bar', null, _s.showTopBar,
+            (v) => _update(_s.copyWith(showTopBar: v))),
+        _switch('Show bottom chapter bar', null, _s.showBottomBar,
+            (v) => _update(_s.copyWith(showBottomBar: v))),
+        _switch('Show chapter slider', null, _s.showChapterSlider,
+            (v) => _update(_s.copyWith(showChapterSlider: v))),
+        _switch('Show prev / next buttons', null, _s.showPrevNext,
+            (v) => _update(_s.copyWith(showPrevNext: v))),
+        _switch('Show bookmark button', null, _s.showBookmarkButton,
+            (v) => _update(_s.copyWith(showBookmarkButton: v))),
+        _switch('Show search button', null, _s.showSearchButton,
+            (v) => _update(_s.copyWith(showSearchButton: v))),
+        _switch('Show chapter-list button', null, _s.showTocButton,
+            (v) => _update(_s.copyWith(showTocButton: v))),
+        _switch('Tap once to hide / show controls',
+            'Scrolling with your finger never shows or hides controls — only a tap does. Tap once to show them, tap again to hide them and keep reading undisturbed.',
+            _s.autoHideBars, (v) => _update(_s.copyWith(autoHideBars: v))),
+        _switch('Edge tap zones', 'Left edge = previous chapter, right edge = next chapter.',
+            _s.tapZones, (v) => _update(_s.copyWith(tapZones: v))),
+        const Text('Navigation position',
+            style: TextStyle(fontWeight: FontWeight.bold)),
+        ...[
+          (0, 'Bottom (classic)'),
+          (1, 'Top, under the title bar'),
+          (2, 'Floating pill at the bottom'),
+        ].map((e) => RadioListTile<int>(
+              title: Text(e.$2),
+              value: e.$1,
+              groupValue: _s.navPosition,
+              onChanged: (v) => _update(_s.copyWith(navPosition: v ?? 0)),
+            )),
+        _heading('Lock'),
+        _switch('Double-tap to lock / unlock',
+            'When locked, a "Locked" (or "Unlocked") message appears briefly and fades away — it does not stay on screen.',
+            _s.doubleTapLockEnabled,
+            (v) => _update(_s.copyWith(doubleTapLockEnabled: v))),
+        _heading('Highlights'),
+        _switch(
+            'Highlights: long-press a paragraph to highlight it in colour and add a note',
+            'Turn off if you do not want highlights at all — long-press will then do nothing.',
+            _s.enableHighlights,
+            (v) => _update(_s.copyWith(enableHighlights: v))),
+        _heading('Text style'),
+        Wrap(
+          spacing: 8,
+          children: ['Left', 'Justified', 'Centre'].asMap().entries.map((e) {
+            final sel = _s.alignIndex == e.key;
+            return ChoiceChip(
+              label: Text(e.value),
+              selected: sel,
+              onSelected: (_) => _update(_s.copyWith(alignIndex: e.key)),
+            );
+          }).toList(),
+        ),
+        _switch('Bold text', null, _s.boldText,
+            (v) => _update(_s.copyWith(boldText: v))),
+      ]),
+    );
+  }
+}
+
+// ── Reading goals & stats — its own screen ──────────────────────────────
+// Previously stats only lived in a small card on the library, and the
+// library did not refresh it after reading, so it looked unimplemented.
+class StatsScreen extends StatelessWidget {
+  final ReaderSettings settings;
+  final ReadingStats stats;
+  final ValueChanged<ReaderSettings> onSettingsChanged;
+  const StatsScreen(
+      {super.key,
+      required this.settings,
+      required this.stats,
+      required this.onSettingsChanged});
+
+  static String _key(DateTime d) =>
+      '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  @override
+  Widget build(BuildContext context) {
+    final today = DateTime.now();
+    return Scaffold(
+      appBar: AppBar(title: const Text('Reading goals & stats')),
+      body: ListView(padding: const EdgeInsets.all(16), children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('${stats.streak} day streak',
+                      style: const TextStyle(
+                          fontSize: 24, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  Text(
+                      'Today ${stats.todayMinutes.toStringAsFixed(0)} / ${settings.goalMinutes} minutes'),
+                  const SizedBox(height: 8),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(4),
+                    child: LinearProgressIndicator(
+                      value: settings.goalMinutes == 0
+                          ? 0
+                          : (stats.todayMinutes / settings.goalMinutes)
+                              .clamp(0.0, 1.0),
+                      color: terracotta,
+                      minHeight: 8,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                      'Total ${stats.totalMinutes.toStringAsFixed(0)} minutes • ${stats.booksFinished} books finished'),
+                ]),
+          ),
+        ),
+        const SizedBox(height: 16),
+        const Text('Daily goal',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+        Row(children: [
+          const Expanded(child: Text('How many minutes a day?')),
+          Text('${settings.goalMinutes} min',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+        ]),
+        Slider(
+          value: settings.goalMinutes.toDouble(),
+          min: 5,
+          max: 120,
+          divisions: 23,
+          onChanged: (v) => onSettingsChanged(
+              settings.copyWith(goalMinutes: v.round())),
+        ),
+        const Text(
+            'Your goal is saved and shows on the library card. Reading time is counted while a book is open, and everything stays on this phone only.',
+            style: TextStyle(color: Colors.grey)),
+        const SizedBox(height: 16),
+        const Text('Last 7 days',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+        ...List.generate(7, (i) {
+          final d = today.subtract(Duration(days: i));
+          final mins = stats.minutesByDay[_key(d)] ?? 0;
+          return ListTile(
+            title: Text(i == 0
+                ? 'Today'
+                : i == 1
+                    ? 'Yesterday'
+                    : '${d.day}/${d.month}/${d.year}'),
+            trailing: Text('${mins.toStringAsFixed(0)} min'),
+          );
+        }),
+      ]),
+    );
   }
 }

@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:inkbloom_reader/app_lang.dart';
 import 'package:inkbloom_reader/isolate_parse.dart';
+import 'package:inkbloom_reader/reader_prefs.dart';
 import 'package:inkbloom_reader/custom_fonts.dart';
 import 'package:inkbloom_reader/dictionary.dart';
 import 'package:inkbloom_reader/formats.dart';
@@ -108,5 +109,38 @@ test('every language covers every English UI key', () {
     expect(book.title, 'mybook');
     expect(book.chapters, isNotEmpty);
     expect(book.chapters.expand((c) => c.paragraphs).join(' '), contains('Hello world'));
+  });
+
+  test('settings survive a save and reload (night, voice, goal, fonts)', () {
+    // Regression: toJson used to drop autoNight, tts, goal, fonts,
+    // so those settings looked dead after leaving a book.
+    const s = ReaderSettings(
+      autoNight: true,
+      nightStartHour: 22,
+      nightEndHour: 6,
+      ttsRate: 0.8,
+      ttsPitch: 1.2,
+      goalMinutes: 45,
+      customFonts: ['MyFont'],
+      languageCode: 'ur',
+      ttsVoiceName: 'en-gb-x-gba-network',
+      ttsVoiceLocale: 'en-GB',
+      showTextSizeButtons: false,
+      enableHighlights: false,
+      themeIndex: 3,
+      navPosition: 2,
+    );
+    final back = ReaderSettings.fromJson(s.toJson());
+    expect(back.autoNight, isTrue);
+    expect(back.nightStartHour, 22);
+    expect(back.ttsRate, 0.8);
+    expect(back.goalMinutes, 45);
+    expect(back.customFonts, ['MyFont']);
+    expect(back.languageCode, 'ur');
+    expect(back.ttsVoiceName, 'en-gb-x-gba-network');
+    expect(back.showTextSizeButtons, isFalse);
+    expect(back.enableHighlights, isFalse);
+    expect(back.themeIndex, 3);
+    expect(back.navPosition, 2);
   });
 }

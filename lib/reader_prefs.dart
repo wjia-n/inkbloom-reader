@@ -58,6 +58,10 @@ class ReaderSettings {
   final double ttsPitch; // 0.5..2.0
   final int goalMinutes; // daily reading goal
   final String languageCode; // UI language: en, ur, ar, es, fr
+  final String ttsVoiceName; // chosen TTS voice, '' = device default
+  final String ttsVoiceLocale; // locale of the chosen voice
+  final bool showTextSizeButtons; // show - / + text size buttons in reader
+  final bool enableHighlights; // long-press paragraph to highlight
   final List<String> customFonts; // runtime-loaded font family names
 
   const ReaderSettings({
@@ -85,10 +89,14 @@ class ReaderSettings {
     this.autoNight = false,
     this.nightStartHour = 21,
     this.nightEndHour = 7,
-    this.ttsRate = 1.0,
+    this.ttsRate = 0.8,
     this.ttsPitch = 1.0,
     this.goalMinutes = 30,
     this.languageCode = 'en',
+    this.ttsVoiceName = '',
+    this.ttsVoiceLocale = '',
+    this.showTextSizeButtons = true,
+    this.enableHighlights = true,
     this.customFonts = const [],
   });
 
@@ -147,6 +155,10 @@ class ReaderSettings {
     double? ttsPitch,
     int? goalMinutes,
     String? languageCode,
+    String? ttsVoiceName,
+    String? ttsVoiceLocale,
+    bool? showTextSizeButtons,
+    bool? enableHighlights,
     List<String>? customFonts,
   }) =>
       ReaderSettings(
@@ -179,6 +191,11 @@ class ReaderSettings {
         ttsPitch: ttsPitch ?? this.ttsPitch,
         goalMinutes: goalMinutes ?? this.goalMinutes,
         languageCode: languageCode ?? this.languageCode,
+        ttsVoiceName: ttsVoiceName ?? this.ttsVoiceName,
+        ttsVoiceLocale: ttsVoiceLocale ?? this.ttsVoiceLocale,
+        showTextSizeButtons:
+            showTextSizeButtons ?? this.showTextSizeButtons,
+        enableHighlights: enableHighlights ?? this.enableHighlights,
         customFonts: customFonts ?? this.customFonts,
       );
 
@@ -204,7 +221,18 @@ class ReaderSettings {
         'autoHideBars': autoHideBars,
         'tapZones': tapZones,
         'doubleTapLockEnabled': doubleTapLockEnabled,
+        'autoNight': autoNight,
+        'nightStartHour': nightStartHour,
+        'nightEndHour': nightEndHour,
+        'ttsRate': ttsRate,
+        'ttsPitch': ttsPitch,
+        'goalMinutes': goalMinutes,
+        'customFonts': customFonts,
         'languageCode': languageCode,
+        'ttsVoiceName': ttsVoiceName,
+        'ttsVoiceLocale': ttsVoiceLocale,
+        'showTextSizeButtons': showTextSizeButtons,
+        'enableHighlights': enableHighlights,
       };
 
   static ReaderSettings fromJson(Map<String, dynamic>? j) {
@@ -238,12 +266,17 @@ class ReaderSettings {
       autoNight: b('autoNight', false),
       nightStartHour: i('nightStartHour', 21),
       nightEndHour: i('nightEndHour', 7),
-      ttsRate: d('ttsRate', 1.0),
+      ttsRate: d('ttsRate', 0.8),
       ttsPitch: d('ttsPitch', 1.0),
       goalMinutes: i('goalMinutes', 30),
       customFonts: ((j['customFonts'] as List?) ?? [])
           .map((e) => e.toString())
           .toList(),
+      languageCode: j['languageCode'] as String? ?? 'en',
+      ttsVoiceName: j['ttsVoiceName'] as String? ?? '',
+      ttsVoiceLocale: j['ttsVoiceLocale'] as String? ?? '',
+      showTextSizeButtons: b('showTextSizeButtons', true),
+      enableHighlights: b('enableHighlights', true),
     );
   }
 
