@@ -445,12 +445,6 @@ class _LibraryScreenState extends State<LibraryScreen> {
       // if it fails again — the book is never silently lost.
     }
   }
-
-  // Kept for callers that still use the old name.
-  Future<bool> _storeBook(String name, Uint8List bytes, Directory dir,
-          Directory covers, int index) async =>
-      (await _storeBookInstant(name, bytes, dir, covers, index)) != null;
-
   /// "Find books on my phone" — the user picks ONE folder (for
   /// example Downloads or a Books folder) and InkBloom imports
   /// every supported book in it by itself. Nothing is forced:
