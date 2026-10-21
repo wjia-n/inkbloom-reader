@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
-import 'package:pdf_text/pdf_text.dart' as pdf_text_plugin;
 import 'package:xml/xml.dart';
 import 'epub_parser.dart';
 import 'pdf_extract.dart';
@@ -22,8 +21,9 @@ class ParsedBook {
   });
 }
 
-/// Multi-format parser: EPUB (real, with cover), PDF (native PdfBox
-/// text extraction on Android, pure-Dart fallback elsewhere),
+/// Multi-format parser: EPUB (real, with cover), PDF (pure-Dart
+/// text extraction — the native pdf_text plugin is incompatible
+/// with AGP 9/Gradle 9, so it was removed),
 /// TXT, Markdown, HTML, FictionBook (.fb2) and RTF.
 /// MOBI/AZW are Amazon formats and are NOT supported: they are
 /// usually DRM-wrapped, and the app says so instead of failing
@@ -50,7 +50,7 @@ class BookParser {
           .copyFormat('rtf');
     }
     if (lower.endsWith('.pdf')) {
-      // PDF is async (native plugin) — use parsePdfFile instead.
+      // PDF is async — use parsePdfFile instead.
       throw const FormatException(
           'PDF needs async parsing: use BookParser.parsePdfFile.');
     }
@@ -83,52 +83,20 @@ class BookParser {
         : name.replaceAll(RegExp(r'[-_]+'), ' ').trim();
   }
 
-  /// Parse a PDF file: native PdfBox extraction first, pure-Dart
-  /// fallback if the native channel is unavailable (web/desktop).
-  /// Each PDF page becomes a chapter section, grouped in pairs so
-  /// chapters stay a comfortable reading length.
+  /// Parse a PDF file with the pure-Dart extractor (Tj/TJ text
+  /// operators + Flate streams). No native plugin: pdf_text 0.5.0
+  /// uses jcenter(), which Gradle 9 removed, so it breaks the
+  /// AGP 9 build. Scanned/image PDFs have no text and are
+  /// rejected honestly.
   static Future<ParsedBook> parsePdfFile(File file, String fileName) async {
     final title = _fileTitle(fileName);
-    try {
-      final doc = await pdf_text_plugin.PDFDoc.fromFile(file);
-      final chapters = <EpubChapter>[];
-      for (var i = 0; i < doc.pages.length; i += 2) {
-        final texts = <String>[];
-        for (var j = i; j < i + 2 && j < doc.pages.length; j++) {
-          texts.add(await doc.pages[j].text);
-        }
-        final paras = texts
-            .join('\n')
-            .split(RegExp(r'\n\s*\n'))
-            .map((s) => s.replaceAll(RegExp(r'\s+'), ' ').trim())
-            .where((s) => s.isNotEmpty)
-            .toList();
-        if (paras.isNotEmpty) {
-          chapters.add(EpubChapter(
-              title: 'Pages ${i + 1}-${(i + 2).clamp(1, doc.pages.length)}',
-              paragraphs: paras));
-        }
-      }
-      if (chapters.isEmpty) {
-        throw const FormatException('No readable text in this PDF.');
-      }
-      return ParsedBook(
-        title: doc.info.title?.isNotEmpty == true ? doc.info.title! : title,
-        author: doc.info.author?.isNotEmpty == true
-            ? doc.info.author!
-            : 'Unknown Author',
-        format: 'pdf',
-        chapters: chapters,
-      );
-    } catch (_) {
-      final bytes = await file.readAsBytes();
-      final text = extractPdfTextFallback(bytes);
-      if (text.isEmpty) {
-        throw const FormatException(
-            'Could not read this PDF. Scanned/image PDFs have no text to extract.');
-      }
-      return _parseTxt(title, text).copyFormat('pdf');
+    final bytes = await file.readAsBytes();
+    final text = extractPdfTextFallback(bytes);
+    if (text.isEmpty) {
+      throw const FormatException(
+          'Could not read this PDF. Scanned/image PDFs have no text to extract.');
     }
+    return _parseTxt(title, text).copyFormat('pdf');
   }
 
   static ParsedBook _parseFb2(String title, Uint8List bytes) {
