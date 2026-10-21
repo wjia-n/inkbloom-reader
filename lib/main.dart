@@ -795,12 +795,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
             _openSettings();
           }
         },
-        items: const [
-          BottomNavigationBarItem(icon: Icon(Icons.menu_book), label: 'Books'),
-          BottomNavigationBarItem(icon: Icon(Icons.search), label: 'Find'),
-          BottomNavigationBarItem(icon: Icon(Icons.book), label: 'Dictionary'),
-          BottomNavigationBarItem(icon: Icon(Icons.bar_chart), label: 'Goals'),
-          BottomNavigationBarItem(icon: Icon(Icons.settings), label: 'Settings'),
+        items: [
+          BottomNavigationBarItem(
+              icon: const Icon(Icons.menu_book), label: lang.t('books')),
+          BottomNavigationBarItem(
+              icon: const Icon(Icons.search), label: lang.t('find')),
+          BottomNavigationBarItem(
+              icon: const Icon(Icons.book), label: lang.t('dictionary')),
+          BottomNavigationBarItem(
+              icon: const Icon(Icons.bar_chart), label: lang.t('goals')),
+          BottomNavigationBarItem(
+              icon: const Icon(Icons.settings), label: lang.t('settings')),
         ],
       ),
       floatingActionButton: Column(
@@ -1444,8 +1449,9 @@ class AppSettingsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final lang = AppLang.fromCode(settings.languageCode);
     return Scaffold(
-      appBar: AppBar(title: const Text('Settings & Transfer')),
+      appBar: AppBar(title: Text(lang.t('settings'))),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
@@ -1466,6 +1472,31 @@ class AppSettingsScreen extends StatelessWidget {
             icon: const Icon(Icons.tune),
             label: const Text(
                 'Reader preferences — text, theme, voice, navigation'),
+          ),
+          const SizedBox(height: 8),
+          ListTile(
+            leading: const Icon(Icons.language),
+            title: Text(lang.t('language')),
+            subtitle: Text(AppLang.fromCode(settings.languageCode).nativeName),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () async {
+              final chosen = await showDialog<String>(
+                context: context,
+                builder: (_) => SimpleDialog(
+                  title: Text(lang.t('chooseLanguage')),
+                  children: AppLang.all
+                      .map((l) => SimpleDialogOption(
+                            onPressed: () => Navigator.pop(context, l.code),
+                            child: Text(
+                                '${l.nativeName}${l.code == settings.languageCode ? ' ✓' : ''}'),
+                          ))
+                      .toList(),
+                ),
+              );
+              if (chosen != null) {
+                onSettingsChanged(settings.copyWith(languageCode: chosen));
+              }
+            },
           ),
           const SizedBox(height: 12),
           _switchTile('Show top bar', settings.showTopBar,
@@ -3279,8 +3310,9 @@ class _ReaderPreferencesScreenState extends State<ReaderPreferencesScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final lang = AppLang.fromCode(_s.languageCode);
     return Scaffold(
-      appBar: AppBar(title: const Text('Reader preferences')),
+      appBar: AppBar(title: Text(lang.t('settings'))),
       body: ListView(padding: const EdgeInsets.all(16), children: [
         const Text(
             'These settings apply to ALL books, not just one. Change them here, or inside any book with the tune icon — it is the same setting, saved everywhere.'),

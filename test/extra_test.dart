@@ -98,7 +98,12 @@ test('every language covers every English UI key', () {
     }
     expect(AppLang.fromCode('ur').rtl, isTrue);
     expect(AppLang.fromCode('ar').rtl, isTrue);
+    expect(AppLang.fromCode('fa').rtl, isTrue);
+    expect(AppLang.fromCode('he').rtl, isTrue);
+    expect(AppLang.fromCode('ps').rtl, isTrue);
     expect(AppLang.fromCode('en').rtl, isFalse);
+    // 50+ languages, all real, all with native names.
+    expect(AppLang.all.length, greaterThanOrEqualTo(50));
   });
 
   test('isolate parse returns a book without touching the UI thread', () {
