@@ -86,18 +86,31 @@ Widget _progressBar(double progress) {
   );
 }
 
-String _dateLabel(DateTime d) {
-  final now = DateTime.now();
-  final today = DateTime(now.year, now.month, now.day);
-  final day = DateTime(d.year, d.month, d.day);
-  final diff = today.difference(day).inDays;
-  if (diff <= 0) return 'Today';
-  if (diff == 1) return 'Yesterday';
+/// "Last opened" in the form the user asked for: minutes,
+/// hours, or days ago — never just a bare date. Older than a
+/// month falls back to a plain date so it stays readable.
+String _lastOpenedLabel(LibraryBook book) {
+  final last = book.lastReadAt;
+  if (last == null) return 'Opened before this update';
+  final diff = DateTime.now().difference(last);
+  if (diff.inMinutes < 1) return 'Opened just now';
+  if (diff.inMinutes < 60) {
+    final m = diff.inMinutes;
+    return 'Opened $m min${m == 1 ? '' : 's'} ago';
+  }
+  if (diff.inHours < 24) {
+    final h = diff.inHours;
+    return 'Opened $h hour${h == 1 ? '' : 's'} ago';
+  }
+  if (diff.inDays < 30) {
+    final d = diff.inDays;
+    return 'Opened $d day${d == 1 ? '' : 's'} ago';
+  }
   const months = [
     'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
   ];
-  return '${months[d.month - 1]} ${d.day}';
+  return 'Opened ${months[last.month - 1]} ${last.day}, ${last.year}';
 }
 
 /// Books — a full, dedicated screen where ONLY books live.
@@ -275,6 +288,16 @@ class _BooksScreenState extends State<BooksScreen> {
                                     fontSize: 12,
                                     color: forest.withValues(alpha: 0.65)),
                               ),
+                              const SizedBox(height: 2),
+                              Text(
+                                book.lastReadAt == null && book.progress == 0
+                                    ? 'Not opened yet'
+                                    : _lastOpenedLabel(book),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                    fontSize: 11, color: terracotta),
+                              ),
                               const Spacer(),
                               if (book.progress > 0) ...[
                                 _progressBar(book.progress),
@@ -388,7 +411,7 @@ class HistoryScreen extends StatelessWidget {
                               _progressBar(current.progress),
                               const SizedBox(height: 6),
                               Text(
-                                '${(current.progress * 100).round()}% read · ${_dateLabel(current.lastReadAt ?? current.addedAt)}',
+                                '${(current.progress * 100).round()}% read · ${_lastOpenedLabel(current)}',
                                 style: const TextStyle(
                                     fontSize: 12, color: terracotta),
                               ),
@@ -453,7 +476,7 @@ class HistoryScreen extends StatelessWidget {
                                     ),
                                     const SizedBox(height: 2),
                                     Text(
-                                      '${book.author} · ${_dateLabel(book.lastReadAt ?? book.addedAt)}',
+                                      '${book.author} · ${_lastOpenedLabel(book)}',
                                       style: TextStyle(
                                           fontSize: 12,
                                           color: forest.withValues(
