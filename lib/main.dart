@@ -1,12 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'app_lang.dart';
 import 'custom_fonts.dart';
+import 'file_read.dart';
 import 'dictionary.dart';
 import 'extra_screens.dart';
 import 'formats.dart';
@@ -130,6 +133,36 @@ Future<Directory> _coversDir() async {
   return d;
 }
 
+/// Small white tool card used on the library home (Stitch reference).
+class _ToolCard extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  const _ToolCard(
+      {required this.icon, required this.label, required this.onTap});
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 6),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Column(children: [
+          Icon(icon, color: forest),
+          const SizedBox(height: 6),
+          Text(label,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12)),
+        ]),
+      ),
+    );
+  }
+}
+
 // ── Library ─────────────────────────────────────────────────────────────
 
 class LibraryScreen extends StatefulWidget {
@@ -155,6 +188,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _load() async {
+    // FAST + SAFE: show the library immediately from what was saved.
+    // The old code re-parsed every imported file on every launch
+    // (including slow PDF extraction), so one big or slow book froze
+    // the whole library on a spinner and imported books never appeared.
+    // Chapters are now parsed lazily, only when a book is opened.
     final prefs = await SharedPreferences.getInstance();
     _settings =
         ReaderSettings.fromJsonString(prefs.getString('inkbloom_settings'));
@@ -173,8 +211,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     final result = <LibraryBook>[];
     for (final s in saved) {
       if (s.isBuiltin) {
-        final sample =
-            builtIns.where((b) => b.id == s.id).firstOrNull;
+        final sample = builtIns.where((b) => b.id == s.id).firstOrNull;
         if (sample != null) {
           result.add(LibraryBook(
             id: sample.id,
@@ -193,36 +230,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
             addedAt: s.addedAt,
           ));
         }
-      } else if (s.filePath != null) {
-        try {
-          final name = s.filePath!.split('/').last;
-          final ParsedBook parsed;
-          if (name.toLowerCase().endsWith('.pdf')) {
-            parsed = await BookParser.parsePdfFile(File(s.filePath!), name);
-          } else {
-            final bytes = await File(s.filePath!).readAsBytes();
-            parsed = BookParser.parse(name, bytes);
-          }
-          result.add(LibraryBook(
-            id: s.id,
-            title: parsed.title,
-            author: parsed.author,
-            format: parsed.format,
-            filePath: s.filePath,
-            coverPath: s.coverPath,
-            chapters: parsed.chapters,
-            progress: s.progress,
-            lastChapter:
-                s.lastChapter.clamp(0, parsed.chapters.length - 1),
-            lastParagraph: s.lastParagraph,
-            bookmarks: s.bookmarks,
-            highlights: s.highlights,
-            shelf: s.shelf,
-            isFavourite: s.isFavourite,
-            tags: s.tags,
-            addedAt: s.addedAt,
-          ));
-        } catch (_) {}
+      } else {
+        // Keep the book exactly as saved. Its file is parsed on open.
+        result.add(s);
       }
     }
     final seen = result.map((b) => b.id).toSet();
@@ -273,10 +283,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
     final covers = await _coversDir();
     var added = 0;
     var failed = 0;
+    var firstError = '';
     for (final f in files) {
-      final bytes = await f.readAsBytes();
+      Uint8List bytes;
+      try {
+        bytes = await readPickedFile(f);
+      } catch (e) {
+        failed++;
+        if (firstError.isEmpty) firstError = e.toString();
+        continue;
+      }
       if (bytes.isEmpty) {
         failed++;
+        if (firstError.isEmpty) {
+          firstError = 'No data could be read from ${f.name}';
+        }
         continue;
       }
       final lowerName = f.name.toLowerCase();
@@ -323,8 +344,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
           );
         });
         added++;
-      } catch (_) {
+      } catch (e) {
         failed++;
+        if (firstError.isEmpty) firstError = e.toString();
       }
     }
     await _persist();
@@ -332,7 +354,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text(failed == 0
               ? 'Added $added book${added == 1 ? '' : 's'}'
-              : 'Added $added, $failed could not be opened')));
+              : firstError.isEmpty
+                  ? 'Added $added, $failed could not be opened'
+                  : 'Added $added, $failed could not be opened. Reason: $firstError'),
+          duration: const Duration(seconds: 6)));
     }
   }
 
@@ -341,7 +366,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     if (picked == null) return;
     final covers = await _coversDir();
     final file = File('${covers.path}/${book.id}.cover');
-    await file.writeAsBytes(await picked.readAsBytes());
+    await file.writeAsBytes(await readPickedFile(picked));
     setState(() {
       final i = _books.indexWhere((b) => b.id == book.id);
       if (i >= 0) _books[i] = book.copyWith(coverPath: file.path);
@@ -358,6 +383,75 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _openBook(LibraryBook book) async {
+    // Lazy parse: a saved imported book has no chapters in memory
+    // until it is opened. Parse here, with a real error if it fails,
+    // instead of opening an empty reader or dropping the book.
+    if (book.chapters.isEmpty && !book.isBuiltin && book.filePath != null) {
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => const AlertDialog(
+          content: Row(children: [
+            CircularProgressIndicator(),
+            SizedBox(width: 16),
+            Expanded(child: Text('Opening your book…')),
+          ]),
+        ),
+      );
+      try {
+        final name = book.filePath!.split('/').last;
+        final ParsedBook parsed;
+        if (name.toLowerCase().endsWith('.pdf')) {
+          parsed = await BookParser.parsePdfFile(File(book.filePath!), name);
+        } else {
+          final bytes = await File(book.filePath!).readAsBytes();
+          parsed = BookParser.parse(name, bytes);
+        }
+        final withChapters = LibraryBook(
+          id: book.id,
+          title: parsed.title,
+          author: parsed.author,
+          format: parsed.format,
+          filePath: book.filePath,
+          coverPath: book.coverPath,
+          chapters: parsed.chapters,
+          progress: book.progress,
+          lastChapter: book.lastChapter,
+          lastParagraph: book.lastParagraph,
+          bookmarks: book.bookmarks,
+          highlights: book.highlights,
+          shelf: book.shelf,
+          isFavourite: book.isFavourite,
+          tags: book.tags,
+          addedAt: book.addedAt,
+        );
+        setState(() {
+          final i = _books.indexWhere((b) => b.id == book.id);
+          if (i >= 0) _books[i] = withChapters;
+        });
+        book = withChapters;
+      } catch (e) {
+        if (mounted) Navigator.pop(context);
+        if (mounted) {
+          await showDialog(
+            context: context,
+            builder: (_) => AlertDialog(
+              title: const Text('Could not open this book'),
+              content: Text(
+                  'The file may have been moved or deleted, or it may be in a format InkBloom cannot read yet.\n\nReason: $e'),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('OK')),
+              ],
+            ),
+          );
+        }
+        return;
+      }
+      if (mounted) Navigator.pop(context);
+    }
     if (book.shelf == 'To Read') {
       final moved = book.copyWith(shelf: 'Reading');
       setState(() {
@@ -406,16 +500,82 @@ class _LibraryScreenState extends State<LibraryScreen> {
     return list;
   }
 
+  Future<void> _pickLanguage() async {
+    final lang = AppLang.fromCode(_settings.languageCode);
+    final chosen = await showDialog<String>(
+      context: context,
+      builder: (_) => SimpleDialog(
+        title: Text(lang.t('chooseLanguage')),
+        children: AppLang.all
+            .map((l) => SimpleDialogOption(
+                  onPressed: () => Navigator.pop(context, l.code),
+                  child: Text(
+                      '${l.nativeName}${l.code == _settings.languageCode ? ' ✓' : ''}'),
+                ))
+            .toList(),
+      ),
+    );
+    if (chosen != null) {
+      _updateSettings(_settings.copyWith(languageCode: chosen));
+    }
+  }
+
+  Future<void> _openSettings() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AppSettingsScreen(
+          settings: _settings,
+          statsJson: jsonEncode(_stats.toJson()),
+          books: _books,
+          onSettingsChanged: _updateSettings,
+          onRestore: (books, settings) {
+            setState(() {
+              _books = books;
+              _settings = settings;
+            });
+            _persist();
+          },
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    final lang = AppLang.fromCode(_settings.languageCode);
+    return Directionality(
+      textDirection: lang.rtl ? TextDirection.rtl : TextDirection.ltr,
+      child: Scaffold(
       appBar: AppBar(
-        title: const Row(children: [
-          Icon(Icons.menu_book_rounded),
-          SizedBox(width: 10),
-          Text('InkBloom Reader'),
+        title: Row(children: [
+          const InkBloomLogo(size: 32),
+          const SizedBox(width: 10),
+          Text(lang.t('appTitle')),
         ]),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.language),
+            tooltip: lang.t('language'),
+            onPressed: () async {
+              final chosen = await showDialog<String>(
+                context: context,
+                builder: (_) => SimpleDialog(
+                  title: Text(lang.t('chooseLanguage')),
+                  children: AppLang.all
+                      .map((l) => SimpleDialogOption(
+                            onPressed: () => Navigator.pop(context, l.code),
+                            child: Text(
+                                '${l.nativeName}${l.code == _settings.languageCode ? ' ✓' : ''}'),
+                          ))
+                      .toList(),
+                ),
+              );
+              if (chosen != null) {
+                _updateSettings(_settings.copyWith(languageCode: chosen));
+              }
+            },
+          ),
           IconButton(
             icon: Icon(_grid ? Icons.view_list : Icons.grid_view),
             onPressed: () => setState(() => _grid = !_grid),
@@ -484,19 +644,148 @@ class _LibraryScreenState extends State<LibraryScreen> {
             heroTag: 'import',
             onPressed: () => _importFiles(),
             icon: const Icon(Icons.add),
-            label: const Text('Import book'),
+            label: Text(lang.t('importBook')),
           ),
         ],
       ),
       body: _loading
-          ? const Center(child: CircularProgressIndicator())
+          ? const Center(
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 12),
+                Text('Opening your library…'),
+              ]))
           : Column(children: [
+              // ── Stitch reference: "Warm Paper Editorial" library ──
+              // 1. One-tap Add a Book banner, 2. Currently Reading hero,
+              // 3. Quick tools. Anyone should understand the app in
+              //    one glance: add a book, resume reading, or use a tool.
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                child: InkWell(
+                  onTap: () => _importFiles(multiple: true),
+                  borderRadius: BorderRadius.circular(16),
+                  child: Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: terracotta,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Row(children: [
+                      const Icon(Icons.add_circle,
+                          color: Colors.white, size: 36),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(lang.t('importBook'),
+                                style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.bold)),
+                            const Text(
+                              'EPUB, PDF, TXT and more — ready in seconds',
+                              style: TextStyle(color: Colors.white),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const Icon(Icons.arrow_forward_ios,
+                          color: Colors.white, size: 18),
+                    ]),
+                  ),
+                ),
+              ),
+              if (_books.any((b) => b.progress > 0)) ...[
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                  child: Builder(builder: (_) {
+                    final current = _books.firstWhere((b) => b.progress > 0);
+                    return Card(
+                      color: Colors.white,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16)),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Row(children: [
+                          coverWidget(current, width: 62, height: 88),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Text('Currently reading',
+                                    style: TextStyle(
+                                        color: terracotta,
+                                        fontWeight: FontWeight.bold)),
+                                Text(current.title,
+                                    style: const TextStyle(
+                                        fontSize: 17,
+                                        fontWeight: FontWeight.bold)),
+                                Text(current.author),
+                                const SizedBox(height: 6),
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(4),
+                                  child: LinearProgressIndicator(
+                                    value: current.progress.clamp(0.0, 1.0),
+                                    color: terracotta,
+                                    backgroundColor: sage.withValues(alpha: 0.4),
+                                    minHeight: 6,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                FilledButton(
+                                  onPressed: () => _openBook(current),
+                                  child: Text(lang.t('continueReading')),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ]),
+                      ),
+                    );
+                  }),
+                ),
+              ],
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                child: Row(children: [
+                  Expanded(
+                    child: _ToolCard(
+                      icon: Icons.book,
+                      label: lang.t('dictionary'),
+                      onTap: () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                            builder: (_) => const DictionaryScreen()),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _ToolCard(
+                      icon: Icons.phone_android,
+                      label: 'Move to new phone',
+                      onTap: _openSettings,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _ToolCard(
+                      icon: Icons.language,
+                      label: lang.t('language'),
+                      onTap: _pickLanguage,
+                    ),
+                  ),
+                ]),
+              ),
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
                 child: TextField(
                   onChanged: (v) => setState(() => _query = v),
                   decoration: InputDecoration(
-                    hintText: 'Search your library…',
+                    hintText: lang.t('searchHint'),
                     prefixIcon: const Icon(Icons.search),
                     filled: true,
                     fillColor: Colors.white,
@@ -616,10 +905,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
                     'Finished'
                   ].map((s) {
                     final sel = _shelfFilter == s;
+                    final label = switch (s) {
+                      'All' => lang.t('all'),
+                      'Favourites' => lang.t('favourites'),
+                      'To Read' => lang.t('toRead'),
+                      'Reading' => lang.t('reading'),
+                      'Finished' => lang.t('finished'),
+                      _ => s,
+                    };
                     return Padding(
                       padding: const EdgeInsets.only(right: 8),
                       child: ChoiceChip(
-                        label: Text(s),
+                        label: Text(label),
                         selected: sel,
                         selectedColor: terracotta,
                         labelStyle: TextStyle(
@@ -634,8 +931,52 @@ class _LibraryScreenState extends State<LibraryScreen> {
               const SizedBox(height: 8),
               Expanded(
                 child: _visible.isEmpty
-                    ? const Center(
-                        child: Text('No books match. Import a book to begin.'))
+                    ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.menu_book,
+                                  size: 64, color: forest),
+                              const SizedBox(height: 16),
+                              Text(
+                                _books.isEmpty
+                                    ? lang.t('noBooksYet')
+                                    : lang.t('noBooksMatch'),
+                                style: const TextStyle(
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.bold,
+                                    color: forest),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                _books.isEmpty
+                                    ? lang.t('importHelp')
+                                    : lang.t('showAllBooks'),
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 20),
+                              if (_books.isEmpty)
+                                FilledButton.icon(
+                                  onPressed: () =>
+                                      _importFiles(multiple: true),
+                                  icon: const Icon(Icons.add),
+                                  label: Text(lang.t('importBook')),
+                                )
+                              else
+                                OutlinedButton(
+                                  onPressed: () => setState(() {
+                                    _query = '';
+                                    _shelfFilter = 'All';
+                                  }),
+                                  child: const Text('Show all books'),
+                                ),
+                            ],
+                          ),
+                        ),
+                      )
                     : _grid
                         ? LayoutBuilder(
                             builder: (context, constraints) {
@@ -670,6 +1011,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                           ),
               ),
             ]),
+      ),
     );
   }
 
@@ -988,7 +1330,7 @@ class AppSettingsScreen extends StatelessWidget {
               if (picked == null) return;
               try {
                 final bundle = TransferBundle.parseZip(
-                    await picked.readAsBytes());
+                    await readPickedFile(picked));
                 final dir = await _booksDir();
                 final covers = await _coversDir();
                 final restored = <LibraryBook>[];
@@ -2096,7 +2438,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                       return;
                     }
                     final family = await CustomFonts.importFont(
-                        picked.name, await picked.readAsBytes());
+                        picked.name, await readPickedFile(picked));
                     if (family == null) return;
                     final fonts = [..._s.customFonts];
                     if (!fonts.contains(family)) fonts.add(family);

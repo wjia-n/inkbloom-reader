@@ -57,6 +57,7 @@ class ReaderSettings {
   final double ttsRate; // 0.5..2.0
   final double ttsPitch; // 0.5..2.0
   final int goalMinutes; // daily reading goal
+  final String languageCode; // UI language: en, ur, ar, es, fr
   final List<String> customFonts; // runtime-loaded font family names
 
   const ReaderSettings({
@@ -87,6 +88,7 @@ class ReaderSettings {
     this.ttsRate = 1.0,
     this.ttsPitch = 1.0,
     this.goalMinutes = 30,
+    this.languageCode = 'en',
     this.customFonts = const [],
   });
 
@@ -144,6 +146,7 @@ class ReaderSettings {
     double? ttsRate,
     double? ttsPitch,
     int? goalMinutes,
+    String? languageCode,
     List<String>? customFonts,
   }) =>
       ReaderSettings(
@@ -175,6 +178,7 @@ class ReaderSettings {
         ttsRate: ttsRate ?? this.ttsRate,
         ttsPitch: ttsPitch ?? this.ttsPitch,
         goalMinutes: goalMinutes ?? this.goalMinutes,
+        languageCode: languageCode ?? this.languageCode,
         customFonts: customFonts ?? this.customFonts,
       );
 
@@ -200,6 +204,7 @@ class ReaderSettings {
         'autoHideBars': autoHideBars,
         'tapZones': tapZones,
         'doubleTapLockEnabled': doubleTapLockEnabled,
+        'languageCode': languageCode,
       };
 
   static ReaderSettings fromJson(Map<String, dynamic>? j) {

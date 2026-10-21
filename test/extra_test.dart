@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:inkbloom_reader/app_lang.dart';
 import 'package:inkbloom_reader/custom_fonts.dart';
 import 'package:inkbloom_reader/dictionary.dart';
 import 'package:inkbloom_reader/formats.dart';
@@ -80,5 +81,21 @@ void main() {
       expect(id.contains('_'), isFalse);
       expect(id.contains('inkbloom'), isTrue);
     }
+  });
+test('every language covers every English UI key', () {
+    // Regression guard for multilingual support: a missing key must
+    // fall back to English, never to a blank label.
+    final enKeys = ['appTitle', 'yourBooks', 'searchHint', 'importBook',
+      'noBooksYet', 'importHelp', 'showAllBooks', 'language',
+      'chooseLanguage', 'all', 'favourites', 'toRead', 'reading',
+      'finished', 'settings', 'dictionary', 'support', 'continueReading'];
+    for (final lang in AppLang.all) {
+      for (final key in enKeys) {
+        expect(lang.t(key), isNotEmpty, reason: '${lang.code} $key');
+      }
+    }
+    expect(AppLang.fromCode('ur').rtl, isTrue);
+    expect(AppLang.fromCode('ar').rtl, isTrue);
+    expect(AppLang.fromCode('en').rtl, isFalse);
   });
 }
