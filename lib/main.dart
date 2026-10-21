@@ -1291,27 +1291,29 @@ class _LibraryScreenState extends State<LibraryScreen> {
                         ? SliverPadding(
                             padding: const EdgeInsets.fromLTRB(
                                 16, 8, 16, 180),
-                            sliver: LayoutBuilder(
-                              builder: (context, constraints) {
-                                final w = constraints.maxWidth;
-                                final cols = w < 600
-                                    ? 2
-                                    : w < 900
-                                        ? 3
-                                        : 4;
-                                return SliverGrid.builder(
-                                  gridDelegate:
-                                      SliverGridDelegateWithFixedCrossAxisCount(
-                                    crossAxisCount: cols,
-                                    childAspectRatio: 0.62,
-                                    crossAxisSpacing: 12,
-                                    mainAxisSpacing: 12,
-                                  ),
-                                  itemCount: _visible.length,
-                                  itemBuilder: (_, i) =>
-                                      _gridCard(_visible[i]),
-                                );
-                              },
+                            sliver: SliverGrid.builder(
+                              // NOTE: do NOT use LayoutBuilder here.
+                              // SliverPadding's child must be a sliver;
+                              // a LayoutBuilder (a box widget) crashed
+                              // the whole library into a grey screen
+                              // in v1.0.8. Column count comes from
+                              // MediaQuery width instead.
+                              gridDelegate:
+                                  SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount:
+                                    MediaQuery.sizeOf(context).width < 600
+                                        ? 2
+                                        : MediaQuery.sizeOf(context).width <
+                                                900
+                                            ? 3
+                                            : 4,
+                                childAspectRatio: 0.62,
+                                crossAxisSpacing: 12,
+                                mainAxisSpacing: 12,
+                              ),
+                              itemCount: _visible.length,
+                              itemBuilder: (_, i) =>
+                                  _gridCard(_visible[i]),
                             ),
                           )
                         : SliverPadding(
