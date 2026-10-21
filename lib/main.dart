@@ -250,21 +250,32 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _importFiles({bool multiple = false}) async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: [
-        'epub', 'pdf', 'txt', 'md', 'markdown', 'html', 'htm', 'fb2', 'rtf'
-      ],
-      allowMultiple: multiple,
-      withData: true,
-    );
-    if (result == null) return;
+    // file_picker 13: pickFiles() is multi, pickFile() is single.
+    // Both return PlatformFile(s) read via readAsBytes().
+    final files = multiple
+        ? await FilePicker.pickFiles(
+            type: FileType.custom,
+            allowedExtensions: [
+              'epub', 'pdf', 'txt', 'md', 'markdown', 'html', 'htm', 'fb2', 'rtf'
+            ],
+          )
+        : [
+            if (await FilePicker.pickFile(
+              type: FileType.custom,
+              allowedExtensions: [
+                'epub', 'pdf', 'txt', 'md', 'markdown', 'html', 'htm', 'fb2', 'rtf'
+              ],
+            ) case final single?)
+              single
+          ];
+    if (files.isEmpty) return;
     final dir = await _booksDir();
     final covers = await _coversDir();
     var added = 0;
     var failed = 0;
-    for (final f in result.files) {
-      if (f.bytes == null) {
+    for (final f in files) {
+      final bytes = await f.readAsBytes();
+      if (bytes.isEmpty) {
         failed++;
         continue;
       }
@@ -283,12 +294,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final ext = f.name.split('.').last.toLowerCase();
         final id = 'book-${DateTime.now().millisecondsSinceEpoch}-$added';
         final file = File('${dir.path}/$id.$ext');
-        await file.writeAsBytes(f.bytes!);
+        await file.writeAsBytes(bytes);
         final ParsedBook parsed;
         if (ext == 'pdf') {
           parsed = await BookParser.parsePdfFile(file, f.name);
         } else {
-          parsed = BookParser.parse(f.name, f.bytes!);
+          parsed = BookParser.parse(f.name, bytes);
         }
         String? coverPath;
         if (parsed.coverBytes != null) {
@@ -326,14 +337,11 @@ class _LibraryScreenState extends State<LibraryScreen> {
   }
 
   Future<void> _setCover(LibraryBook book) async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.image,
-      withData: true,
-    );
-    if (result == null || result.files.single.bytes == null) return;
+    final picked = await FilePicker.pickFile(type: FileType.image);
+    if (picked == null) return;
     final covers = await _coversDir();
     final file = File('${covers.path}/${book.id}.cover');
-    await file.writeAsBytes(result.files.single.bytes!);
+    await file.writeAsBytes(await picked.readAsBytes());
     setState(() {
       final i = _books.indexWhere((b) => b.id == book.id);
       if (i >= 0) _books[i] = book.copyWith(coverPath: file.path);
@@ -958,10 +966,11 @@ class AppSettingsScreen extends StatelessWidget {
                 settingsJson: jsonEncode(settings.toJson()),
                 statsJson: statsJson,
               );
-              final path = await FilePicker.platform.saveFile(
+              final uri = await FilePicker.saveFile(
                 fileName: 'inkbloom-backup.inkbloom',
                 bytes: zip,
               );
+              final path = uri?.toString();
               if (context.mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                     content: Text(path == null
@@ -975,14 +984,11 @@ class AppSettingsScreen extends StatelessWidget {
           const SizedBox(height: 8),
           OutlinedButton.icon(
             onPressed: () async {
-              final result = await FilePicker.platform.pickFiles(
-                type: FileType.any,
-                withData: true,
-              );
-              if (result == null || result.files.single.bytes == null) return;
+              final picked = await FilePicker.pickFile(type: FileType.any);
+              if (picked == null) return;
               try {
                 final bundle = TransferBundle.parseZip(
-                    result.files.single.bytes!);
+                    await picked.readAsBytes());
                 final dir = await _booksDir();
                 final covers = await _coversDir();
                 final restored = <LibraryBook>[];
@@ -2082,19 +2088,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 ),
                 TextButton.icon(
                   onPressed: () async {
-                    final result =
-                        await FilePicker.platform.pickFiles(
+                    final picked = await FilePicker.pickFile(
                       type: FileType.custom,
                       allowedExtensions: ['ttf', 'otf'],
-                      withData: true,
                     );
-                    if (result == null ||
-                        result.files.single.bytes == null) {
+                    if (picked == null) {
                       return;
                     }
                     final family = await CustomFonts.importFont(
-                        result.files.single.name,
-                        result.files.single.bytes!);
+                        picked.name, await picked.readAsBytes());
                     if (family == null) return;
                     final fonts = [..._s.customFonts];
                     if (!fonts.contains(family)) fonts.add(family);
