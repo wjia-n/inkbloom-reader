@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:path_provider/path_provider.dart';
@@ -10,6 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'app_lang.dart';
 import 'custom_fonts.dart';
 import 'file_read.dart';
+import 'isolate_parse.dart';
 import 'dictionary.dart';
 import 'extra_screens.dart';
 import 'formats.dart';
@@ -156,7 +157,9 @@ class _ToolCard extends StatelessWidget {
           const SizedBox(height: 6),
           Text(label,
               textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 12)),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11)),
         ]),
       ),
     );
@@ -185,6 +188,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
   void initState() {
     super.initState();
     _load();
+    // Safety net: the library must NEVER sit on a spinner forever.
+    // If loading is still unfinished after 5 seconds, show the
+    // sample books and let the user in — saved books load on open.
+    Future.delayed(const Duration(seconds: 5), () {
+      if (mounted && _loading) {
+        setState(() {
+          _books = sampleBooks();
+          _loading = false;
+        });
+      }
+    });
   }
 
   Future<void> _load() async {
@@ -279,75 +293,74 @@ class _LibraryScreenState extends State<LibraryScreen> {
               single
           ];
     if (files.isEmpty) return;
-    final dir = await _booksDir();
-    final covers = await _coversDir();
+    // Progress dialog: the user must SEE work happening, never a
+    // frozen screen. Parsing itself runs in an isolate (see
+    // isolate_parse.dart), so the UI stays alive on big books.
+    final progress = ValueNotifier<String>('Starting…');
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => ValueListenableBuilder<String>(
+          valueListenable: progress,
+          builder: (_, v, __) => AlertDialog(
+            content: Row(children: [
+              const CircularProgressIndicator(),
+              const SizedBox(width: 16),
+              Expanded(child: Text(v)),
+            ]),
+          ),
+        ),
+      );
+    }
     var added = 0;
     var failed = 0;
     var firstError = '';
-    for (final f in files) {
-      Uint8List bytes;
-      try {
-        bytes = await readPickedFile(f);
-      } catch (e) {
-        failed++;
-        if (firstError.isEmpty) firstError = e.toString();
-        continue;
-      }
-      if (bytes.isEmpty) {
-        failed++;
-        if (firstError.isEmpty) {
-          firstError = 'No data could be read from ${f.name}';
+    try {
+      final dir = await _booksDir();
+      final covers = await _coversDir();
+      for (var i = 0; i < files.length; i++) {
+        final f = files[i];
+        progress.value = 'Importing ${i + 1} of ${files.length}: ${f.name}';
+        Uint8List bytes;
+        try {
+          bytes = await readPickedFile(f);
+        } catch (e) {
+          failed++;
+          if (firstError.isEmpty) firstError = e.toString();
+          continue;
         }
-        continue;
-      }
-      final lowerName = f.name.toLowerCase();
-      if (lowerName.endsWith('.mobi') || lowerName.endsWith('.azw') ||
-          lowerName.endsWith('.azw3') || lowerName.endsWith('.azw4')) {
-        failed++;
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-              content: Text(
-                  'MOBI/AZW are Amazon formats and are not supported. Convert that book to EPUB first, then import it.')));
+        if (bytes.isEmpty) {
+          failed++;
+          if (firstError.isEmpty) {
+            firstError = 'No data could be read from ${f.name}';
+          }
+          continue;
         }
-        continue;
-      }
-      try {
-        final ext = f.name.split('.').last.toLowerCase();
-        final id = 'book-${DateTime.now().millisecondsSinceEpoch}-$added';
-        final file = File('${dir.path}/$id.$ext');
-        await file.writeAsBytes(bytes);
-        final ParsedBook parsed;
-        if (ext == 'pdf') {
-          parsed = await BookParser.parsePdfFile(file, f.name);
+        final lowerName = f.name.toLowerCase();
+        if (lowerName.endsWith('.mobi') ||
+            lowerName.endsWith('.azw') ||
+            lowerName.endsWith('.azw3') ||
+            lowerName.endsWith('.azw4')) {
+          failed++;
+          if (firstError.isEmpty) {
+            firstError =
+                'MOBI/AZW are Amazon formats and are not supported. Convert that book to EPUB first, then import it.';
+          }
+          continue;
+        }
+        final ok = await _storeBook(f.name, bytes, dir, covers, i);
+        if (ok) {
+          added++;
         } else {
-          parsed = BookParser.parse(f.name, bytes);
+          failed++;
+          if (firstError.isEmpty) {
+            firstError = 'Could not open ${f.name}';
+          }
         }
-        String? coverPath;
-        if (parsed.coverBytes != null) {
-          final cf = File('${covers.path}/$id.cover');
-          await cf.writeAsBytes(parsed.coverBytes!);
-          coverPath = cf.path;
-        }
-        setState(() {
-          _books.insert(
-            0,
-            LibraryBook(
-              id: id,
-              title: parsed.title,
-              author: parsed.author,
-              format: parsed.format,
-              filePath: file.path,
-              coverPath: coverPath,
-              chapters: parsed.chapters,
-              addedAt: DateTime.now(),
-            ),
-          );
-        });
-        added++;
-      } catch (e) {
-        failed++;
-        if (firstError.isEmpty) firstError = e.toString();
       }
+    } finally {
+      if (mounted) Navigator.pop(context);
     }
     await _persist();
     if (mounted) {
@@ -357,6 +370,141 @@ class _LibraryScreenState extends State<LibraryScreen> {
               : firstError.isEmpty
                   ? 'Added $added, $failed could not be opened'
                   : 'Added $added, $failed could not be opened. Reason: $firstError'),
+          duration: const Duration(seconds: 6)));
+    }
+  }
+
+  /// Stores one book: writes the file, parses it OFF the UI thread,
+  /// saves its cover, and puts it at the top of the library.
+  /// Returns true on success. Never throws.
+  Future<bool> _storeBook(String name, Uint8List bytes, Directory dir,
+      Directory covers, int index) async {
+    try {
+      final ext = name.split('.').last.toLowerCase();
+      final id =
+          'book-${DateTime.now().microsecondsSinceEpoch}-$index';
+      final file = File('${dir.path}/$id.$ext');
+      await file.writeAsBytes(bytes);
+      final parsed = parsedBookFromIsolate(
+        await compute(parseBookIsolate, {'name': name, 'bytes': bytes})
+            .timeout(const Duration(seconds: 90)),
+      );
+      String? coverPath;
+      if (parsed.coverBytes != null) {
+        final cf = File('${covers.path}/$id.cover');
+        await cf.writeAsBytes(parsed.coverBytes!);
+        coverPath = cf.path;
+      }
+      if (!mounted) return true;
+      setState(() {
+        _books.insert(
+          0,
+          LibraryBook(
+            id: id,
+            title: parsed.title,
+            author: parsed.author,
+            format: parsed.format,
+            filePath: file.path,
+            coverPath: coverPath,
+            chapters: parsed.chapters,
+            addedAt: DateTime.now(),
+          ),
+        );
+      });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// "Find books on my phone" — the user picks ONE folder (for
+  /// example Downloads or a Books folder) and InkBloom imports
+  /// every supported book in it by itself. Nothing is forced:
+  /// the user chooses the folder, and can still pick single
+  /// files with Import book instead.
+  Future<void> _findBooksOnPhone() async {
+    final dirPath = await FilePicker.getDirectoryPath(
+      dialogTitle: 'Choose a folder with books',
+    );
+    if (dirPath == null) return;
+    const exts = {
+      'epub', 'pdf', 'txt', 'md', 'markdown', 'html', 'htm', 'fb2', 'rtf'
+    };
+    final found = <File>[];
+    try {
+      await for (final e in Directory(dirPath).list(
+          recursive: true, followLinks: false)) {
+        if (e is File &&
+            exts.contains(e.path.split('.').last.toLowerCase())) {
+          found.add(e);
+          if (found.length >= 200) break;
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(
+                'Could not read that folder ($e). Try another folder, or tap Import book to pick files directly.'),
+            duration: const Duration(seconds: 6)));
+      }
+      return;
+    }
+    if (found.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text(
+                'No books found in that folder. Try another folder, or tap Import book to pick files directly.')));
+      }
+      return;
+    }
+    final progress = ValueNotifier<String>('Found ${found.length} books…');
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => ValueListenableBuilder<String>(
+          valueListenable: progress,
+          builder: (_, v, __) => AlertDialog(
+            content: Row(children: [
+              const CircularProgressIndicator(),
+              const SizedBox(width: 16),
+              Expanded(child: Text(v)),
+            ]),
+          ),
+        ),
+      );
+    }
+    var added = 0;
+    var failed = 0;
+    var firstError = '';
+    try {
+      final dir = await _booksDir();
+      final covers = await _coversDir();
+      for (var i = 0; i < found.length; i++) {
+        final f = found[i];
+        progress.value =
+            'Importing ${i + 1} of ${found.length}: ${f.path.split('/').last}';
+        try {
+          final bytes = await f.readAsBytes();
+          if (await _storeBook(f.path.split('/').last, bytes, dir, covers, i)) {
+            added++;
+          } else {
+            failed++;
+          }
+        } catch (e) {
+          failed++;
+          if (firstError.isEmpty) firstError = e.toString();
+        }
+      }
+    } finally {
+      if (mounted) Navigator.pop(context);
+    }
+    await _persist();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(failed == 0
+              ? 'Found and added $added book${added == 1 ? '' : 's'} from your phone'
+              : 'Added $added, $failed could not be opened${firstError.isEmpty ? '' : '. Reason: $firstError'}'),
           duration: const Duration(seconds: 6)));
     }
   }
@@ -549,84 +697,56 @@ class _LibraryScreenState extends State<LibraryScreen> {
       child: Scaffold(
       appBar: AppBar(
         title: Row(children: [
-          const InkBloomLogo(size: 32),
-          const SizedBox(width: 10),
-          Text(lang.t('appTitle')),
+          const InkBloomLogo(size: 28),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(lang.t('appTitle'),
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 18)),
+          ),
         ]),
         actions: [
           IconButton(
             icon: const Icon(Icons.language),
             tooltip: lang.t('language'),
-            onPressed: () async {
-              final chosen = await showDialog<String>(
-                context: context,
-                builder: (_) => SimpleDialog(
-                  title: Text(lang.t('chooseLanguage')),
-                  children: AppLang.all
-                      .map((l) => SimpleDialogOption(
-                            onPressed: () => Navigator.pop(context, l.code),
-                            child: Text(
-                                '${l.nativeName}${l.code == _settings.languageCode ? ' ✓' : ''}'),
-                          ))
-                      .toList(),
-                ),
-              );
-              if (chosen != null) {
-                _updateSettings(_settings.copyWith(languageCode: chosen));
-              }
-            },
-          ),
-          IconButton(
-            icon: Icon(_grid ? Icons.view_list : Icons.grid_view),
-            onPressed: () => setState(() => _grid = !_grid),
-            tooltip: 'Grid / list view',
-          ),
-          PopupMenuButton<String>(
-            onSelected: (v) => setState(() => _sort = v),
-            itemBuilder: (_) => ['Recent', 'Title', 'Author']
-                .map((s) => PopupMenuItem(value: s, child: Text('Sort: $s')))
-                .toList(),
-            icon: const Icon(Icons.sort),
-          ),
-          IconButton(
-            icon: const Icon(Icons.book),
-            tooltip: 'Dictionary (offline)',
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const DictionaryScreen()),
-            ),
-          ),
-          IconButton(
-            icon: const Icon(Icons.coffee),
-            tooltip: 'Support InkBloom — 2 tips only',
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const SupportScreen()),
-            ),
+            onPressed: _pickLanguage,
           ),
           IconButton(
             icon: const Icon(Icons.settings),
-            onPressed: () async {
-              await Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => AppSettingsScreen(
-                    settings: _settings,
-                    statsJson: jsonEncode(_stats.toJson()),
-                    books: _books,
-                    onSettingsChanged: _updateSettings,
-                    onRestore: (books, settings) {
-                      setState(() {
-                        _books = books;
-                        _settings = settings;
-                      });
-                      _persist();
-                    },
-                  ),
-                ),
-              );
-            },
             tooltip: 'Settings & transfer',
+            onPressed: _openSettings,
+          ),
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert),
+            tooltip: 'More',
+            onSelected: (v) async {
+              if (v == 'grid') {
+                setState(() => _grid = !_grid);
+              } else if (v.startsWith('sort:')) {
+                setState(() => _sort = v.substring(5));
+              } else if (v == 'dictionary') {
+                await Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (_) => const DictionaryScreen()),
+                );
+              } else if (v == 'support') {
+                await Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (_) => const SupportScreen()),
+                );
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'grid', child: Text('Grid / list view')),
+              PopupMenuItem(value: 'sort:Recent', child: Text('Sort: Recent')),
+              PopupMenuItem(value: 'sort:Title', child: Text('Sort: Title')),
+              PopupMenuItem(value: 'sort:Author', child: Text('Sort: Author')),
+              PopupMenuItem(
+                  value: 'dictionary', child: Text('Dictionary (offline)')),
+              PopupMenuItem(value: 'support', child: Text('Support')),
+            ],
           ),
         ],
       ),
@@ -697,6 +817,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   ),
                 ),
               ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    onPressed: _findBooksOnPhone,
+                    icon: const Icon(Icons.search),
+                    label: const Text(
+                        'Or find books already on my phone — you pick the folder, it imports them'),
+                  ),
+                ),
+              ),
               if (_books.any((b) => b.progress > 0)) ...[
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
@@ -720,10 +852,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                         color: terracotta,
                                         fontWeight: FontWeight.bold)),
                                 Text(current.title,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
                                     style: const TextStyle(
                                         fontSize: 17,
                                         fontWeight: FontWeight.bold)),
-                                Text(current.author),
+                                Text(current.author,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis),
                                 const SizedBox(height: 6),
                                 ClipRRect(
                                   borderRadius: BorderRadius.circular(4),
@@ -765,8 +901,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   const SizedBox(width: 8),
                   Expanded(
                     child: _ToolCard(
+                      icon: Icons.search,
+                      label: 'Find books',
+                      onTap: _findBooksOnPhone,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _ToolCard(
                       icon: Icons.phone_android,
-                      label: 'Move to new phone',
+                      label: 'New phone',
                       onTap: _openSettings,
                     ),
                   ),

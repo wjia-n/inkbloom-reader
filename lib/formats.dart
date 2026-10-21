@@ -89,8 +89,14 @@ class BookParser {
   /// AGP 9 build. Scanned/image PDFs have no text and are
   /// rejected honestly.
   static Future<ParsedBook> parsePdfFile(File file, String fileName) async {
-    final title = _fileTitle(fileName);
     final bytes = await file.readAsBytes();
+    return parsePdfBytes(bytes, fileName);
+  }
+
+  /// PDF from raw bytes (used by the isolate import path, which has
+  /// no File access on the worker side).
+  static ParsedBook parsePdfBytes(Uint8List bytes, String fileName) {
+    final title = _fileTitle(fileName);
     final text = extractPdfTextFallback(bytes);
     if (text.isEmpty) {
       throw const FormatException(

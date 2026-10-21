@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:inkbloom_reader/app_lang.dart';
+import 'package:inkbloom_reader/isolate_parse.dart';
 import 'package:inkbloom_reader/custom_fonts.dart';
 import 'package:inkbloom_reader/dictionary.dart';
 import 'package:inkbloom_reader/formats.dart';
@@ -97,5 +98,15 @@ test('every language covers every English UI key', () {
     expect(AppLang.fromCode('ur').rtl, isTrue);
     expect(AppLang.fromCode('ar').rtl, isTrue);
     expect(AppLang.fromCode('en').rtl, isFalse);
+  });
+
+  test('isolate parse returns a book without touching the UI thread', () {
+    final bytes = Uint8List.fromList(
+        'My Book\n\nChapter One\n\nHello world.'.codeUnits);
+    final m = parseBookIsolate({'name': 'mybook.txt', 'bytes': bytes});
+    final book = parsedBookFromIsolate(m);
+    expect(book.title, 'mybook');
+    expect(book.chapters, isNotEmpty);
+    expect(book.chapters.expand((c) => c.paragraphs).join(' '), contains('Hello world'));
   });
 }
