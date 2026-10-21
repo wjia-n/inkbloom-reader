@@ -15,6 +15,7 @@ import 'dictionary.dart';
 import 'extra_screens.dart';
 import 'formats.dart';
 import 'books_screens.dart';
+import 'brightness.dart';
 import 'models.dart';
 import 'reader_prefs.dart';
 import 'stats.dart';
@@ -2015,6 +2016,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void initState() {
     super.initState();
     _s = widget.settings;
+    applyBrightness(_s.brightness);
     _chapter =
         widget.book.lastChapter.clamp(0, widget.book.chapters.length - 1);
     _bookmarks = [...widget.book.bookmarks];
@@ -2083,6 +2085,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _statsTimer?.cancel();
     _lockTimer?.cancel();
     _recordReadingTime();
+    resetBrightness();
     _tts.stop();
     _scroll.dispose();
     _pageController.dispose();
@@ -2090,6 +2093,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   void _setSettings(ReaderSettings s) {
+    if (s.brightness != _s.brightness) {
+      applyBrightness(s.brightness);
+    }
     final voiceChanged = s.ttsRate != _s.ttsRate ||
         s.ttsPitch != _s.ttsPitch ||
         s.ttsVoiceName != _s.ttsVoiceName ||
@@ -3518,6 +3524,20 @@ class _ReaderPreferencesScreenState extends State<ReaderPreferencesScreen> {
             (v) => _update(_s.copyWith(nightStartHour: v.round()))),
         _slider('Night ends (hour)', _s.nightEndHour.toDouble(), 0, 23,
             (v) => _update(_s.copyWith(nightEndHour: v.round()))),
+        _heading('Brightness'),
+        const Text(
+            'In-app only: this changes brightness inside InkBloom while you read. It never changes your phone\'s system brightness.'),
+        _switch('Auto brightness',
+            'Use your phone\'s brightness instead of a fixed level.',
+            _s.brightness < 0,
+            (v) => _update(_s.copyWith(
+                brightness: v ? -1 : (_s.brightness < 0 ? 0.7 : _s.brightness)))),
+        if (_s.brightness >= 0)
+          _slider('Brightness', _s.brightness, 0.05, 1.0,
+              (v) => _update(_s.copyWith(brightness: v))),
+        if (_s.brightness >= 0)
+          Text('${(_s.brightness * 100).round()}%',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
         _heading('Read aloud — voices & speed'),
         const Text(
             'Pick a voice below, then tap Test to hear it. The voice you pick is used in every book, and you can change it any time — while reading, or here. No robotic default is forced on you.'),

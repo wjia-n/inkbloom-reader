@@ -20,6 +20,21 @@ class MainActivity : FlutterActivity() {
                     } catch (e: Exception) {
                         result.error("READ_FAILED", e.message, null)
                     }
+                } else if (call.method == "setBrightness") {
+                    // In-app only: WindowManager.LayoutParams
+                    // screenBrightness affects this window, never
+                    // the system setting. -1 = use system brightness.
+                    try {
+                        val b = (call.argument<Double>("brightness") ?: -1.0).toFloat()
+                        runOnUiThread {
+                            val attrs = window.attributes
+                            attrs.screenBrightness = if (b < 0) -1f else b.coerceIn(0.05f, 1.0f)
+                            window.attributes = attrs
+                        }
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("BRIGHTNESS_FAILED", e.message, null)
+                    }
                 } else {
                     result.notImplemented()
                 }

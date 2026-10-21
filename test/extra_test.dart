@@ -134,6 +134,7 @@ test('every language covers every English UI key', () {
       enableHighlights: false,
       themeIndex: 3,
       navPosition: 2,
+      brightness: 0.6,
     );
     final back = ReaderSettings.fromJson(s.toJson());
     expect(back.autoNight, isTrue);

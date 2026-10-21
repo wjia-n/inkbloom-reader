@@ -63,6 +63,7 @@ class ReaderSettings {
   final bool showTextSizeButtons; // show - / + text size buttons in reader
   final bool enableHighlights; // long-press paragraph to highlight
   final List<String> customFonts; // runtime-loaded font family names
+  final double brightness; // -1 = Auto (system brightness), else 0.05..1.0
 
   const ReaderSettings({
     this.fontSize = 18,
@@ -98,6 +99,7 @@ class ReaderSettings {
     this.showTextSizeButtons = true,
     this.enableHighlights = true,
     this.customFonts = const [],
+    this.brightness = -1,
   });
 
   String? get fontFamily {
@@ -160,6 +162,7 @@ class ReaderSettings {
     bool? showTextSizeButtons,
     bool? enableHighlights,
     List<String>? customFonts,
+    double? brightness,
   }) =>
       ReaderSettings(
         fontSize: fontSize ?? this.fontSize,
@@ -197,6 +200,7 @@ class ReaderSettings {
             showTextSizeButtons ?? this.showTextSizeButtons,
         enableHighlights: enableHighlights ?? this.enableHighlights,
         customFonts: customFonts ?? this.customFonts,
+        brightness: brightness ?? this.brightness,
       );
 
   Map<String, dynamic> toJson() => {
@@ -233,6 +237,7 @@ class ReaderSettings {
         'ttsVoiceLocale': ttsVoiceLocale,
         'showTextSizeButtons': showTextSizeButtons,
         'enableHighlights': enableHighlights,
+        'brightness': brightness,
       };
 
   static ReaderSettings fromJson(Map<String, dynamic>? j) {
@@ -277,6 +282,7 @@ class ReaderSettings {
       ttsVoiceLocale: j['ttsVoiceLocale'] as String? ?? '',
       showTextSizeButtons: b('showTextSizeButtons', true),
       enableHighlights: b('enableHighlights', true),
+      brightness: d('brightness', -1),
     );
   }
 
