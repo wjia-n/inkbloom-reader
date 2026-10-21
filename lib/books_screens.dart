@@ -6,9 +6,14 @@ import 'extra_screens.dart';
 import 'models.dart';
 
 /// Soft InkBloom look for the two new screens: warm cream
-/// background, white cards with a soft shadow (no hard borders),
-/// big rounded corners, gentle spacing. Everything sits in
-/// exactly one place, nothing crammed.
+/// background, soft shadows (no hard borders), big rounded
+/// corners, gentle spacing. Placements borrow the clean
+/// Neat Reader layout — cover first, title underneath,
+/// time above the cover, Continue on the right — but in
+/// InkBloom's own forest/terracotta/cream style, and with
+/// InkBloom's extras Neat does not have: progress bars,
+/// last-opened times, shelves, and local history that
+/// needs no cloud upload at all.
 const _softShadow = [
   BoxShadow(
     color: Color(0x14000000),
@@ -113,20 +118,49 @@ String _lastOpenedLabel(LibraryBook book) {
   return 'Opened ${months[last.month - 1]} ${last.day}, ${last.year}';
 }
 
+/// Short time for the grid, Neat-style: "Just now",
+/// "4 hours", "1 min", or "New" for a book added in the
+/// last day that has never been opened.
+String _shortTimeLabel(LibraryBook book) {
+  if (book.lastReadAt == null) {
+    final addedAgo = DateTime.now().difference(book.addedAt);
+    if (addedAgo.inHours < 24 && book.progress == 0) return 'New';
+    return 'Not opened yet';
+  }
+  return _lastOpenedLabel(book).replaceFirst('Opened ', '');
+}
+
+Widget _continueButton(void Function() onTap) {
+  return FilledButton(
+    onPressed: onTap,
+    style: FilledButton.styleFrom(
+      backgroundColor: terracotta,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(24),
+      ),
+    ),
+    child: const Text('Continue'),
+  );
+}
+
 /// Books — a full, dedicated screen where ONLY books live.
-/// No banner, no tools, no stats, no settings. Just your books:
-/// search at the top, shelf chips under it, then the books
-/// themselves in a neat grid. Everything else stays on its
-/// own page, reached from the bottom bar.
+/// Clean grid, Neat-style placement, InkBloom style:
+/// search on top, "All books" and "Sort by" dropdowns
+/// under it, three covers across, the time label above
+/// each cover, the title underneath, and a + tile at the
+/// end to add a book. No banner, no tools, no stats.
 class BooksScreen extends StatefulWidget {
-  final List<LibraryBook> books;
+  final List<LibraryBook> Function() getBooks;
   final void Function(LibraryBook) onOpen;
   final void Function(LibraryBook) onFavourite;
+  final Future<void> Function() onAdd;
   const BooksScreen(
       {super.key,
-      required this.books,
+      required this.getBooks,
       required this.onOpen,
-      required this.onFavourite});
+      required this.onFavourite,
+      required this.onAdd});
 
   @override
   State<BooksScreen> createState() => _BooksScreenState();
@@ -135,11 +169,11 @@ class BooksScreen extends StatefulWidget {
 class _BooksScreenState extends State<BooksScreen> {
   String _query = '';
   String _shelf = 'All';
-  String _sort = 'Recently added';
+  String _sort = 'Recent';
 
   @override
   Widget build(BuildContext context) {
-    var shown = widget.books.where((b) {
+    var shown = widget.getBooks().where((b) {
       if (_shelf == 'Favourites' && !b.isFavourite) return false;
       if (_shelf != 'All' &&
           _shelf != 'Favourites' &&
@@ -155,42 +189,34 @@ class _BooksScreenState extends State<BooksScreen> {
       }
       return true;
     }).toList();
-    if (_sort == 'Title A–Z') {
+    if (_sort == 'Book name') {
       shown.sort((a, b) =>
           a.title.toLowerCase().compareTo(b.title.toLowerCase()));
-    } else if (_sort == 'Author A–Z') {
-      shown.sort((a, b) =>
-          a.author.toLowerCase().compareTo(b.author.toLowerCase()));
-    } else {
+    } else if (_sort == 'Recently added') {
       shown.sort((a, b) => b.addedAt.compareTo(a.addedAt));
+    } else {
+      // Recent: last opened first, never-opened books last.
+      shown.sort((a, b) {
+        final da = a.lastReadAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final db = b.lastReadAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final c = db.compareTo(da);
+        return c != 0 ? c : b.addedAt.compareTo(a.addedAt);
+      });
     }
     const shelves = [
       'All', 'Favourites', 'To Read', 'Reading', 'Finished'
     ];
+    const sorts = ['Recent', 'Book name', 'Recently added'];
     return Scaffold(
       backgroundColor: cream,
-      appBar: AppBar(
-        title: const Text('My Books'),
-        actions: [
-          PopupMenuButton<String>(
-            icon: const Icon(Icons.sort),
-            onSelected: (v) => setState(() => _sort = v),
-            itemBuilder: (_) => const [
-              PopupMenuItem(
-                  value: 'Recently added', child: Text('Recently added')),
-              PopupMenuItem(value: 'Title A–Z', child: Text('Title A–Z')),
-              PopupMenuItem(value: 'Author A–Z', child: Text('Author A–Z')),
-            ],
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('Books')),
       body: Column(
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
             child: TextField(
               decoration: InputDecoration(
-                hintText: 'Search your books…',
+                hintText: 'Search books',
                 prefixIcon: const Icon(Icons.search, color: forest),
                 filled: true,
                 fillColor: Colors.white,
@@ -202,35 +228,57 @@ class _BooksScreenState extends State<BooksScreen> {
               onChanged: (v) => setState(() => _query = v),
             ),
           ),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
+          Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Row(
-              children: shelves.map((s) {
-                final selected = _shelf == s;
-                return Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: ChoiceChip(
-                    label: Text(s),
-                    selected: selected,
-                    selectedColor: forest,
-                    labelStyle: TextStyle(
-                        color: selected ? Colors.white : forest),
-                    backgroundColor: Colors.white,
-                    onSelected: (_) => setState(() => _shelf = s),
+              children: [
+                PopupMenuButton<String>(
+                  onSelected: (v) => setState(() => _shelf = v),
+                  itemBuilder: (_) => shelves
+                      .map((s) => PopupMenuItem(
+                          value: s,
+                          child: Text(
+                              s == 'All' ? 'All books' : s)))
+                      .toList(),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _shelf == 'All' ? 'All books' : _shelf,
+                        style: const TextStyle(
+                            fontSize: 14, color: forest),
+                      ),
+                      const Icon(Icons.arrow_drop_down, color: forest),
+                    ],
                   ),
-                );
-              }).toList(),
+                ),
+                const Spacer(),
+                PopupMenuButton<String>(
+                  onSelected: (v) => setState(() => _sort = v),
+                  itemBuilder: (_) => sorts
+                      .map((s) =>
+                          PopupMenuItem(value: s, child: Text(s)))
+                      .toList(),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('Sort by',
+                          style: TextStyle(fontSize: 14, color: forest)),
+                      Icon(Icons.arrow_drop_down, color: forest),
+                    ],
+                  ),
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           Expanded(
             child: shown.isEmpty
                 ? Center(
                     child: Padding(
                       padding: const EdgeInsets.all(32),
                       child: Text(
-                        'No books here yet.\nImport one from the library and it will appear here.',
+                        'No books here yet.\nTap + below to add one.',
                         textAlign: TextAlign.center,
                         style: TextStyle(
                             color: forest.withValues(alpha: 0.7),
@@ -242,77 +290,87 @@ class _BooksScreenState extends State<BooksScreen> {
                     padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
                     gridDelegate:
                         const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 2,
-                      mainAxisSpacing: 16,
-                      crossAxisSpacing: 16,
-                      childAspectRatio: 0.62,
+                      crossAxisCount: 3,
+                      mainAxisSpacing: 20,
+                      crossAxisSpacing: 12,
+                      childAspectRatio: 0.52,
                     ),
-                    itemCount: shown.length,
+                    itemCount: shown.length + 1,
                     itemBuilder: (_, i) {
+                      if (i == shown.length) {
+                        // + tile, Neat-style: tap to add a book.
+                        return InkWell(
+                          onTap: () async {
+                            await widget.onAdd();
+                            if (mounted) setState(() {});
+                          },
+                          borderRadius: BorderRadius.circular(14),
+                          child: Container(
+                            height: 152,
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFEDE6D3),
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: const Center(
+                              child: Icon(Icons.add,
+                                  size: 40, color: forest),
+                            ),
+                          ),
+                        );
+                      }
                       final book = shown[i];
-                      final pct = (book.progress * 100).round();
+                      final isNew = _shortTimeLabel(book) == 'New';
                       return InkWell(
                         onTap: () => widget.onOpen(book),
                         onLongPress: () => widget.onFavourite(book),
-                        borderRadius: BorderRadius.circular(20),
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(20),
-                            boxShadow: _softShadow,
-                          ),
-                          padding: const EdgeInsets.all(12),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Center(
-                                child: softCoverWidget(book,
-                                    width: 110, height: 156),
-                              ),
-                              const SizedBox(height: 10),
-                              Text(
-                                book.title,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 14,
-                                    color: forest),
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                book.author,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                    fontSize: 12,
-                                    color: forest.withValues(alpha: 0.65)),
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                book.lastReadAt == null && book.progress == 0
-                                    ? 'Not opened yet'
-                                    : _lastOpenedLabel(book),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                    fontSize: 11, color: terracotta),
-                              ),
-                              const Spacer(),
-                              if (book.progress > 0) ...[
-                                _progressBar(book.progress),
-                                const SizedBox(height: 4),
-                                Text('$pct% read',
-                                    style: const TextStyle(
-                                        fontSize: 11, color: terracotta)),
-                              ] else
-                                Text(book.formatLabel,
+                        borderRadius: BorderRadius.circular(14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                if (isNew) ...[
+                                  Container(
+                                    width: 7,
+                                    height: 7,
+                                    decoration: const BoxDecoration(
+                                      color: terracotta,
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 4),
+                                ],
+                                Expanded(
+                                  child: Text(
+                                    _shortTimeLabel(book),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
                                     style: TextStyle(
                                         fontSize: 11,
-                                        color:
-                                            forest.withValues(alpha: 0.55))),
-                            ],
-                          ),
+                                        color: isNew
+                                            ? terracotta
+                                            : forest.withValues(
+                                                alpha: 0.6)),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 4),
+                            Center(
+                              child: softCoverWidget(book,
+                                  width: 108, height: 152),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              book.title,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  fontSize: 13,
+                                  color: forest,
+                                  fontWeight: FontWeight.w500),
+                            ),
+                          ],
                         ),
                       );
                     },
@@ -324,23 +382,21 @@ class _BooksScreenState extends State<BooksScreen> {
   }
 }
 
-/// History — the books you were reading, in the order you
-/// last read them. The book you are currently reading sits
-/// at the top, big: large cover, title, author, progress
-/// and one clear "Continue reading" button. The rest follow
-/// as neat rows underneath.
+/// Reading Now / History — the book you are currently
+/// reading at the top as a row (cover, title, time,
+/// Continue button), then "Recently" underneath with the
+/// same row for every other book you have opened.
+/// Local only: unlike Neat, nothing here needs a cloud
+/// upload to show up.
 class HistoryScreen extends StatelessWidget {
-  final List<LibraryBook> books;
+  final List<LibraryBook> Function() getBooks;
   final void Function(LibraryBook) onOpen;
   const HistoryScreen(
-      {super.key, required this.books, required this.onOpen});
+      {super.key, required this.getBooks, required this.onOpen});
 
   @override
   Widget build(BuildContext context) {
-    // A book counts as history if it was opened (lastReadAt set)
-    // or it already has reading progress from before history
-    // tracking existed.
-    final history = books.where((b) {
+    final history = getBooks().where((b) {
       return b.lastReadAt != null || b.progress > 0;
     }).toList()
       ..sort((a, b) {
@@ -352,7 +408,7 @@ class HistoryScreen extends StatelessWidget {
     final rest = history.length <= 1 ? <LibraryBook>[] : history.sublist(1);
     return Scaffold(
       backgroundColor: cream,
-      appBar: AppBar(title: const Text('History')),
+      appBar: AppBar(title: const Text('Reading Now')),
       body: history.isEmpty
           ? const Center(
               child: Padding(
@@ -368,134 +424,90 @@ class HistoryScreen extends StatelessWidget {
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
               children: [
                 if (current != null) ...[
-                  const Text(
-                    'Currently reading',
-                    style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.bold,
-                        color: terracotta,
-                        letterSpacing: 0.5),
-                  ),
-                  const SizedBox(height: 10),
-                  Container(
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(24),
-                      boxShadow: _softShadow,
-                    ),
-                    padding: const EdgeInsets.all(16),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        softCoverWidget(current, width: 110, height: 156),
-                        const SizedBox(width: 16),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                current.title,
-                                style: const TextStyle(
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.bold,
-                                    color: forest),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                current.author,
-                                style: TextStyle(
-                                    fontSize: 14,
-                                    color: forest.withValues(alpha: 0.65)),
-                              ),
-                              const SizedBox(height: 12),
-                              _progressBar(current.progress),
-                              const SizedBox(height: 6),
-                              Text(
-                                '${(current.progress * 100).round()}% read · ${_lastOpenedLabel(current)}',
-                                style: const TextStyle(
-                                    fontSize: 12, color: terracotta),
-                              ),
-                              const SizedBox(height: 14),
-                              FilledButton.icon(
-                                onPressed: () => onOpen(current),
-                                icon: const Icon(Icons.play_arrow),
-                                label: const Text('Continue reading'),
-                                style: FilledButton.styleFrom(
-                                  backgroundColor: terracotta,
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(24),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      softCoverWidget(current, width: 110, height: 156),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              current.title,
+                              style: const TextStyle(
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.bold,
+                                  color: forest),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              _lastOpenedLabel(current),
+                              style: TextStyle(
+                                  fontSize: 13,
+                                  color: forest.withValues(alpha: 0.65)),
+                            ),
+                            const SizedBox(height: 10),
+                            _progressBar(current.progress),
+                            const SizedBox(height: 4),
+                            Text(
+                              '${(current.progress * 100).round()}% read',
+                              style: const TextStyle(
+                                  fontSize: 12, color: terracotta),
+                            ),
+                          ],
                         ),
-                      ],
-                    ),
+                      ),
+                      const SizedBox(width: 12),
+                      _continueButton(() => onOpen(current)),
+                    ],
                   ),
-                  const SizedBox(height: 24),
+                  const SizedBox(height: 28),
                 ],
                 if (rest.isNotEmpty) ...[
                   const Text(
-                    'Reading history',
+                    'Recently',
                     style: TextStyle(
                         fontSize: 16,
                         fontWeight: FontWeight.bold,
                         color: forest),
                   ),
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 12),
                   ...rest.map((book) {
                     return Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: InkWell(
-                        onTap: () => onOpen(book),
-                        borderRadius: BorderRadius.circular(20),
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(20),
-                            boxShadow: _softShadow,
-                          ),
-                          padding: const EdgeInsets.all(12),
-                          child: Row(
-                            children: [
-                              softCoverWidget(book, width: 56, height: 80),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment:
-                                      CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      book.title,
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                          fontWeight: FontWeight.bold,
-                                          color: forest),
-                                    ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      '${book.author} · ${_lastOpenedLabel(book)}',
-                                      style: TextStyle(
-                                          fontSize: 12,
-                                          color: forest.withValues(
-                                              alpha: 0.65)),
-                                    ),
-                                    const SizedBox(height: 8),
-                                    _progressBar(book.progress),
-                                  ],
+                      padding: const EdgeInsets.only(bottom: 16),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          softCoverWidget(book, width: 56, height: 80),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  book.title,
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      color: forest),
                                 ),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                '${(book.progress * 100).round()}%',
-                                style: const TextStyle(
-                                    fontSize: 12, color: terracotta),
-                              ),
-                            ],
+                                const SizedBox(height: 2),
+                                Text(
+                                  _lastOpenedLabel(book),
+                                  style: TextStyle(
+                                      fontSize: 12,
+                                      color: forest.withValues(alpha: 0.65)),
+                                ),
+                                const SizedBox(height: 6),
+                                _progressBar(book.progress),
+                              ],
+                            ),
                           ),
-                        ),
+                          const SizedBox(width: 12),
+                          _continueButton(() => onOpen(book)),
+                        ],
                       ),
                     );
                   }),

@@ -333,13 +333,16 @@ class _LibraryScreenState extends State<LibraryScreen> {
           }
           continue;
         }
+        _importDuplicate = null;
         final ok = await _storeBookInstant(f.name, bytes, dir, covers, i);
         if (ok != null) {
           added++;
         } else {
           failed++;
           if (firstError.isEmpty) {
-            firstError = 'Could not save ${f.name}';
+            firstError = _importDuplicate != null
+                ? '$_importDuplicate already exists in your library'
+                : 'Could not save ${f.name}';
           }
         }
       }
@@ -372,10 +375,21 @@ class _LibraryScreenState extends State<LibraryScreen> {
   /// This is what makes import take seconds, not minutes: the
   /// old code parsed every book before showing anything, so one
   /// big PDF froze the whole import. Returns the new book id.
+  String? _importDuplicate;
+
   Future<String?> _storeBookInstant(String name, Uint8List bytes,
       Directory dir, Directory covers, int index) async {
     try {
       final ext = name.split('/').last.split('.').last.toLowerCase();
+      // Neat-style duplicate guard: importing the same book
+      // twice used to silently double it. Now it is skipped
+      // with a plain "already exists" message instead.
+      final clean = _cleanTitle(name).toLowerCase();
+      if (_books.any((b) =>
+          b.title.toLowerCase() == clean && b.format == ext)) {
+        _importDuplicate = _cleanTitle(name);
+        return null;
+      }
       final id = 'book-${DateTime.now().microsecondsSinceEpoch}-$index';
       final file = File('${dir.path}/$id.$ext');
       await file.writeAsBytes(bytes);
@@ -517,12 +531,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
         final f = found[i];
         try {
           final bytes = await f.readAsBytes();
+          _importDuplicate = null;
           if (await _storeBookInstant(
                   f.path.split('/').last, bytes, dir, covers, i) !=
               null) {
             added++;
           } else {
             failed++;
+            if (firstError.isEmpty && _importDuplicate != null) {
+              firstError =
+                  '$_importDuplicate already exists in your library';
+            }
           }
         } catch (e) {
           failed++;
@@ -828,17 +847,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
               context,
               MaterialPageRoute(
                   builder: (_) => BooksScreen(
-                      books: _books,
+                      getBooks: () => _books,
                       onOpen: _openBook,
                       onFavourite: (b) => _updateBook(
-                          b.copyWith(isFavourite: !b.isFavourite)))),
+                          b.copyWith(isFavourite: !b.isFavourite)),
+                      onAdd: () => _importFiles(multiple: true))),
             );
           } else if (i == 1) {
             Navigator.push(
               context,
               MaterialPageRoute(
-                  builder: (_) =>
-                      HistoryScreen(books: _books, onOpen: _openBook)),
+                  builder: (_) => HistoryScreen(
+                      getBooks: () => _books, onOpen: _openBook)),
             );
           } else if (i == 2) {
             _findBooksOnPhone();
