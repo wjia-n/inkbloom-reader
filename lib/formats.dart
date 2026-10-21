@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:archive/archive.dart';
 import 'package:xml/xml.dart';
 import 'epub_parser.dart';
 import 'pdf_extract.dart';
@@ -24,7 +25,9 @@ class ParsedBook {
 /// Multi-format parser: EPUB (real, with cover), PDF (pure-Dart
 /// text extraction — the native pdf_text plugin is incompatible
 /// with AGP 9/Gradle 9, so it was removed),
-/// TXT, Markdown, HTML, FictionBook (.fb2) and RTF.
+/// TXT, Markdown, HTML, FictionBook (.fb2), RTF, Word (.docx)
+/// and OpenDocument (.odt). Both office formats are ZIPs of
+/// XML, so they parse with the same archive+xml tools as EPUB.
 /// MOBI/AZW are Amazon formats and are NOT supported: they are
 /// usually DRM-wrapped, and the app says so instead of failing
 /// silently. Convert those to EPUB first, then import.
@@ -43,6 +46,12 @@ class BookParser {
     }
     if (lower.endsWith('.fb2')) {
       return _parseFb2(_fileTitle(fileName), bytes);
+    }
+    if (lower.endsWith('.docx')) {
+      return _parseDocx(_fileTitle(fileName), bytes);
+    }
+    if (lower.endsWith('.odt')) {
+      return _parseOdt(_fileTitle(fileName), bytes);
     }
     if (lower.endsWith('.rtf')) {
       final plain = _rtfToText(utf8.decode(bytes, allowMalformed: true));
@@ -103,6 +112,126 @@ class BookParser {
           'Could not read this PDF. Scanned/image PDFs have no text to extract.');
     }
     return _parseTxt(title, text).copyFormat('pdf');
+  }
+
+  /// Word .docx: ZIP, text lives in word/document.xml as
+  /// <w:t> runs inside <w:p> paragraphs. Heading styles
+  /// (Heading 1) start a new chapter, like an EPUB.
+  static ParsedBook _parseDocx(String title, Uint8List bytes) {
+    final archive = ZipDecoder().decodeBytes(bytes);
+    String? findXml(String path) {
+      for (final f in archive.files) {
+        if (f.name == path) {
+          return utf8.decode(f.content as List<int>, allowMalformed: true);
+        }
+      }
+      return null;
+    }
+    var bookTitle = title;
+    var author = 'Unknown Author';
+    final core = findXml('docProps/core.xml');
+    if (core != null) {
+      try {
+        final doc = XmlDocument.parse(core);
+        final t = doc.findAllElements('dc:title').firstOrNull;
+        if (t != null && t.innerText.trim().isNotEmpty) {
+          bookTitle = t.innerText.trim();
+        }
+        final a = doc.findAllElements('dc:creator').firstOrNull;
+        if (a != null && a.innerText.trim().isNotEmpty) {
+          author = a.innerText.trim();
+        }
+      } catch (_) {}
+    }
+    final xml = findXml('word/document.xml');
+    if (xml == null) {
+      throw const FormatException('This DOCX has no document text.');
+    }
+    final doc = XmlDocument.parse(xml);
+    final chapters = <EpubChapter>[];
+    var curTitle = bookTitle;
+    var cur = <String>[];
+    void flush() {
+      if (cur.isNotEmpty) {
+        chapters.add(EpubChapter(title: curTitle, paragraphs: cur));
+        cur = <String>[];
+      }
+    }
+    for (final para in doc.findAllElements('w:p')) {
+      final text = para
+          .findAllElements('w:t')
+          .map((e) => e.innerText)
+          .join('');
+      if (text.trim().isEmpty) continue;
+      final style = para
+          .findElements('w:pPr')
+          .firstOrNull
+          ?.findElements('w:pStyle')
+          .firstOrNull
+          ?.getAttribute('w:val');
+      if (style != null && style.toLowerCase().contains('heading1')) {
+        flush();
+        curTitle = text.trim();
+      } else {
+        cur.add(text);
+      }
+    }
+    flush();
+    if (chapters.isEmpty) {
+      throw const FormatException('This DOCX has no readable text.');
+    }
+    return ParsedBook(
+        title: bookTitle,
+        author: author,
+        format: 'docx',
+        chapters: chapters);
+  }
+
+  /// OpenDocument .odt: ZIP, text lives in content.xml as
+  /// <text:p> paragraphs and <text:h> headings. Headings
+  /// start a new chapter.
+  static ParsedBook _parseOdt(String title, Uint8List bytes) {
+    final archive = ZipDecoder().decodeBytes(bytes);
+    String? xml;
+    for (final f in archive.files) {
+      if (f.name == 'content.xml') {
+        xml = utf8.decode(f.content as List<int>, allowMalformed: true);
+        break;
+      }
+    }
+    if (xml == null) {
+      throw const FormatException('This ODT has no document text.');
+    }
+    final doc = XmlDocument.parse(xml);
+    final chapters = <EpubChapter>[];
+    var curTitle = title;
+    var cur = <String>[];
+    void flush() {
+      if (cur.isNotEmpty) {
+        chapters.add(EpubChapter(title: curTitle, paragraphs: cur));
+        cur = <String>[];
+      }
+    }
+    for (final el in doc.descendants.whereType<XmlElement>()) {
+      if (el.name.local == 'h') {
+        final text = el.innerText.trim();
+        if (text.isEmpty) continue;
+        flush();
+        curTitle = text;
+      } else if (el.name.local == 'p') {
+        final text = el.innerText.trim();
+        if (text.isNotEmpty) cur.add(text);
+      }
+    }
+    flush();
+    if (chapters.isEmpty) {
+      throw const FormatException('This ODT has no readable text.');
+    }
+    return ParsedBook(
+        title: title,
+        author: 'Unknown Author',
+        format: 'odt',
+        chapters: chapters);
   }
 
   static ParsedBook _parseFb2(String title, Uint8List bytes) {

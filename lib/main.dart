@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -275,25 +276,18 @@ class _LibraryScreenState extends State<LibraryScreen> {
     _persist();
   }
 
-  Future<void> _importFiles({bool multiple = false}) async {
-    // file_picker 13: pickFiles() is multi, pickFile() is single.
-    // Both return PlatformFile(s) read via readAsBytes().
-    final files = multiple
-        ? await FilePicker.pickFiles(
-            type: FileType.custom,
-            allowedExtensions: [
-              'epub', 'pdf', 'txt', 'md', 'markdown', 'html', 'htm', 'fb2', 'rtf'
-            ],
-          )
-        : [
-            if (await FilePicker.pickFile(
-              type: FileType.custom,
-              allowedExtensions: [
-                'epub', 'pdf', 'txt', 'md', 'markdown', 'html', 'htm', 'fb2', 'rtf'
-              ],
-            ) case final single?)
-              single
-          ];
+  Future<void> _importFiles({bool multiple = true}) async {
+    // Batch import, always: the picker lets you tick several
+    // books at once (long-press / Select in the system picker).
+    // The old single-file Import button is what made batch
+    // import look broken — it now picks many too.
+    final files = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: [
+        'epub', 'pdf', 'txt', 'md', 'markdown', 'html', 'htm', 'fb2', 'rtf',
+        'docx', 'odt'
+      ],
+    );
     if (files.isEmpty) return;
     // Instant import: no blocking dialog, no parsing here.
     // Books appear in the library right away; content parses
@@ -422,7 +416,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
     try {
       final parsed = parsedBookFromIsolate(
         await compute(parseBookIsolate, {'name': name, 'bytes': bytes})
-            .timeout(const Duration(seconds: 120)),
+            .timeout(const Duration(seconds: 300)),
       );
       String? coverPath;
       if (parsed.coverBytes != null) {
@@ -463,7 +457,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       try {
         final cover = await compute(
                 coverBookIsolate, {'name': name, 'bytes': bytes})
-            .timeout(const Duration(seconds: 30));
+            .timeout(const Duration(seconds: 60));
         final coverBytes = cover['cover'] as Uint8List?;
         if (coverBytes != null && mounted) {
           final cf = File('${covers.path}/$id.cover');
@@ -493,7 +487,8 @@ class _LibraryScreenState extends State<LibraryScreen> {
     );
     if (dirPath == null) return;
     const exts = {
-      'epub', 'pdf', 'txt', 'md', 'markdown', 'html', 'htm', 'fb2', 'rtf'
+      'epub', 'pdf', 'txt', 'md', 'markdown', 'html', 'htm', 'fb2', 'rtf',
+      'docx', 'odt'
     };
     final found = <File>[];
     try {
@@ -589,24 +584,39 @@ class _LibraryScreenState extends State<LibraryScreen> {
     // instead of opening an empty reader or dropping the book.
     if (book.chapters.isEmpty && !book.isBuiltin && book.filePath != null) {
       if (!mounted) return;
+      // Cancellable: the old dialog trapped the user for the
+      // full 2-minute timeout with no way out. Cancel now
+      // just closes the dialog; the parse finishing later is
+      // ignored, and tapping the book again retries.
+      var openCancelled = false;
       showDialog(
         context: context,
-        barrierDismissible: false,
-        builder: (_) => const AlertDialog(
-          content: Row(children: [
+        barrierDismissible: true,
+        builder: (ctx) => AlertDialog(
+          content: const Row(children: [
             CircularProgressIndicator(),
             SizedBox(width: 16),
             Expanded(child: Text('Opening your book…')),
           ]),
+          actions: [
+            TextButton(
+              onPressed: () {
+                openCancelled = true;
+                Navigator.pop(ctx);
+              },
+              child: const Text('Cancel'),
+            ),
+          ],
         ),
-      );
+      ).then((_) => openCancelled = true);
       try {
         final name = book.filePath!.split('/').last;
         final bytes = await File(book.filePath!).readAsBytes();
         final parsed = parsedBookFromIsolate(
           await compute(parseBookIsolate, {'name': name, 'bytes': bytes})
-              .timeout(const Duration(seconds: 120)),
+              .timeout(const Duration(seconds: 300)),
         );
+        if (openCancelled) return;
         String? coverPath = book.coverPath;
         if (parsed.coverBytes != null && coverPath == null) {
           final covers = await _coversDir();
@@ -640,6 +650,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         book = withChapters;
         _persist();
       } catch (e) {
+        if (openCancelled) return;
         if (mounted) Navigator.pop(context);
         if (mounted) {
           await showDialog(
@@ -664,7 +675,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
         }
         return;
       }
-      if (mounted) Navigator.pop(context);
+      if (!openCancelled && mounted) Navigator.pop(context);
     }
     // Opening a book counts as reading history, even if its
     // chapters were already parsed on a previous open.
@@ -787,7 +798,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
           const InkBloomLogo(size: 28),
           const SizedBox(width: 8),
           Flexible(
-            child: Text(lang.t('appTitle'),
+            child: const Text('Ink Bloom',
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(fontSize: 18)),
           ),
@@ -921,7 +932,13 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 SizedBox(height: 12),
                 Text('Opening your library…'),
               ]))
-          : Column(children: [
+          // Books fill the screen: the whole library scrolls as
+          // one page, so the header scrolls away and the grid
+          // gets the full screen instead of a squeezed strip at
+          // the bottom (user complaint 2026-10-21).
+          : CustomScrollView(slivers: [
+              SliverToBoxAdapter(
+                child: Column(children: [
               // ── Stitch reference: "Warm Paper Editorial" library ──
               // 1. One-tap Add a Book banner, 2. Currently Reading hero,
               // 3. Quick tools. Anyone should understand the app in
@@ -951,7 +968,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                                     fontSize: 20,
                                     fontWeight: FontWeight.bold)),
                             const Text(
-                              'EPUB, PDF, TXT and more — ready in seconds',
+                              'EPUB, PDF, DOCX, ODT, TXT and more — ready in seconds',
                               style: TextStyle(color: Colors.white),
                             ),
                           ],
@@ -1093,7 +1110,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
-                      '${_books.length} books • ${_books.where((b) => b.progress > 0).length} in progress • EPUB, PDF, TXT, MD, HTML, FB2, RTF',
+                      '${_books.length} books • ${_books.where((b) => b.progress > 0).length} in progress • EPUB, PDF, DOCX, ODT, TXT, MD, HTML, FB2, RTF',
                       style: const TextStyle(color: forest),
                     ),
                   ),
@@ -1219,9 +1236,12 @@ class _LibraryScreenState extends State<LibraryScreen> {
                 ),
               ),
               const SizedBox(height: 8),
-              Expanded(
-                child: _visible.isEmpty
-                    ? Center(
+                ]),
+              ),
+              _visible.isEmpty
+                  ? SliverFillRemaining(
+                      hasScrollBody: false,
+                      child: Center(
                         child: Padding(
                           padding: const EdgeInsets.all(24),
                           child: Column(
@@ -1266,40 +1286,43 @@ class _LibraryScreenState extends State<LibraryScreen> {
                             ],
                           ),
                         ),
-                      )
+                      ))
                     : _grid
-                        ? LayoutBuilder(
-                            builder: (context, constraints) {
-                              final w = constraints.maxWidth;
-                              final cols = w < 600
-                                  ? 2
-                                  : w < 900
-                                      ? 3
-                                      : 4;
-                              return GridView.builder(
-                                padding: const EdgeInsets.fromLTRB(
-                                    16, 8, 16, 180),
-                                gridDelegate:
-                                    SliverGridDelegateWithFixedCrossAxisCount(
-                                  crossAxisCount: cols,
-                                  childAspectRatio: 0.62,
-                                  crossAxisSpacing: 12,
-                                  mainAxisSpacing: 12,
-                                ),
-                                itemCount: _visible.length,
-                                itemBuilder: (_, i) =>
-                                    _gridCard(_visible[i]),
-                              );
-                            },
+                        ? SliverPadding(
+                            padding: const EdgeInsets.fromLTRB(
+                                16, 8, 16, 180),
+                            sliver: LayoutBuilder(
+                              builder: (context, constraints) {
+                                final w = constraints.maxWidth;
+                                final cols = w < 600
+                                    ? 2
+                                    : w < 900
+                                        ? 3
+                                        : 4;
+                                return SliverGrid.builder(
+                                  gridDelegate:
+                                      SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: cols,
+                                    childAspectRatio: 0.62,
+                                    crossAxisSpacing: 12,
+                                    mainAxisSpacing: 12,
+                                  ),
+                                  itemCount: _visible.length,
+                                  itemBuilder: (_, i) =>
+                                      _gridCard(_visible[i]),
+                                );
+                              },
+                            ),
                           )
-                        : ListView.builder(
-                            padding:
-                                const EdgeInsets.fromLTRB(16, 8, 16, 180),
-                            itemCount: _visible.length,
-                            itemBuilder: (_, i) =>
-                                _listCard(_visible[i]),
+                        : SliverPadding(
+                            padding: const EdgeInsets.fromLTRB(
+                                16, 8, 16, 180),
+                            sliver: SliverList.builder(
+                              itemCount: _visible.length,
+                              itemBuilder: (_, i) =>
+                                  _listCard(_visible[i]),
+                            ),
                           ),
-              ),
             ]),
       ),
     );
@@ -1606,9 +1629,6 @@ class AppSettingsScreen extends StatelessWidget {
           _switchTile('Edge tap zones (left = back, right = next)',
               settings.tapZones,
               (v) => onSettingsChanged(settings.copyWith(tapZones: v))),
-          _switchTile('Double-tap to lock / unlock', settings.doubleTapLockEnabled,
-              (v) => onSettingsChanged(
-                  settings.copyWith(doubleTapLockEnabled: v))),
           const SizedBox(height: 8),
           const Text('Navigation position',
               style: TextStyle(fontWeight: FontWeight.bold)),
@@ -1995,13 +2015,14 @@ class _ReaderScreenState extends State<ReaderScreen> {
   late List<int> _bookmarks;
   late List<Highlight> _highlights;
   late bool _barsVisible;
-  late bool _locked;
+  // NOTE: page lock was removed 2026-10-21 at the user's request:
+  // Neat-style full screen has no lock pill, no lock notice,
+  // and no big Controls button — tap the page to show/hide
+  // controls, and nothing sits on the page while reading.
   String _searchTerm = '';
   List<SearchHit> _searchHits = [];
   int _searchHitIndex = 0;
   final Map<int, GlobalKey> _paraKeys = {};
-  bool _showLockNotice = false;
-  Timer? _lockTimer;
   final _scroll = ScrollController();
   final _pageController = PageController();
   final _scaffoldKey = GlobalKey<ScaffoldState>();
@@ -2022,7 +2043,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _bookmarks = [...widget.book.bookmarks];
     _highlights = [...widget.book.highlights];
     _barsVisible = true;
-    _locked = false;
+    _applySystemUi();
     _lastTick = DateTime.now();
     _loadReaderExtras();
     _tts.setCompletionHandler(() {
@@ -2083,13 +2104,30 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void dispose() {
     _statsTimer?.cancel();
-    _lockTimer?.cancel();
     _recordReadingTime();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     resetBrightness();
     _tts.stop();
     _scroll.dispose();
     _pageController.dispose();
     super.dispose();
+  }
+
+  /// True immersive full screen while reading with bars hidden:
+  /// status + navigation bars disappear (immersiveSticky), so
+  /// Android's top bar and its notifications stop hanging over
+  /// the page. Bars visible = normal edge-to-edge again.
+  void _applySystemUi() {
+    if (_barsVisible) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    } else {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
+  }
+
+  void _setBarsVisible(bool v) {
+    setState(() => _barsVisible = v);
+    _applySystemUi();
   }
 
   void _setSettings(ReaderSettings s) {
@@ -2108,17 +2146,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
     }
   }
 
-  void _setLocked(bool v) {
-    setState(() {
-      _locked = v;
-      _showLockNotice = true;
-    });
-    _lockTimer?.cancel();
-    _lockTimer = Timer(const Duration(milliseconds: 1600), () {
-      if (mounted) setState(() => _showLockNotice = false);
-    });
-  }
-
   void _jumpToHit(int idx) {
     if (_searchHits.isEmpty) return;
     final hit = _searchHits[idx.clamp(0, _searchHits.length - 1)];
@@ -2133,14 +2160,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     });
   }
 
-  void _guarded(VoidCallback action) {
-    if (_locked) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Locked — double-tap the page to unlock')));
-      return;
-    }
-    action();
-  }
+  void _guarded(VoidCallback action) => action();
 
   void _go(int chapter) {
     if (chapter < 0 || chapter >= widget.book.chapters.length) return;
@@ -2694,8 +2714,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   }
                 });
               });
-            } else if (v == 'lock') {
-              if (_s.doubleTapLockEnabled) _setLocked(!_locked);
             }
           },
           itemBuilder: (_) => [
@@ -2708,9 +2726,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 child: Text(_bookmarks.contains(_chapter)
                     ? 'Remove bookmark'
                     : 'Bookmark this chapter')),
-            PopupMenuItem(
-                value: 'lock',
-                child: Text(_locked ? 'Unlock page' : 'Lock page')),
           ],
         ),
       ],
@@ -2770,26 +2785,14 @@ class _ReaderScreenState extends State<ReaderScreen> {
           }),
         ]),
       ),
-      floatingActionButton:
-          (!showBars || !_s.showTopBar || !_s.showBottomBar)
-              ? FloatingActionButton.extended(
-                  onPressed: () => setState(() => _barsVisible = true),
-                  icon: const Icon(Icons.tune),
-                  label: const Text('Controls'),
-                  tooltip: 'Show reading controls',
-                )
-              : null,
       bottomNavigationBar:
           (_s.showBottomBar && showBars && _s.navPosition == 0)
               ? _chapterBar()
               : null,
       body: Builder(
         builder: (scaffoldContext) => GestureDetector(
-          onDoubleTap: _s.doubleTapLockEnabled
-              ? () => _setLocked(!_locked)
-              : null,
           onTap: _s.autoHideBars
-              ? () => setState(() => _barsVisible = !_barsVisible)
+              ? () => _setBarsVisible(!_barsVisible)
               : null,
           child: Stack(children: [
             Column(children: [
@@ -2872,27 +2875,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   child: _chapterBar(),
                 ),
               ),
-            if (_showLockNotice)
-              Center(
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 20, vertical: 12),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.8),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Row(mainAxisSize: MainAxisSize.min, children: [
-                    Icon(_locked ? Icons.lock : Icons.lock_open,
-                        color: Colors.white),
-                    const SizedBox(width: 8),
-                    Text(_locked ? 'Locked' : 'Unlocked',
-                        style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold)),
-                  ]),
-                ),
-              ),
             // Text size - / + buttons: hideable in Reader preferences.
             if (_s.showTextSizeButtons && showBars)
               Positioned(
@@ -2927,7 +2909,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
             // Edge tap zones, when enabled: left edge = previous
             // chapter, right edge = next chapter. Kept clear of the
             // top/bottom bars so scrolling in the middle still works.
-            if (_s.tapZones && !_locked) ...[
+            if (_s.tapZones) ...[
               Positioned(
                 left: 0,
                 top: 120,
@@ -3238,11 +3220,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
                     title: const Text('Edge tap zones'),
                     value: _s.tapZones,
                     onChanged: (v) => update(_s.copyWith(tapZones: v))),
-                SwitchListTile(
-                    title: const Text('Double-tap lock'),
-                    value: _s.doubleTapLockEnabled,
-                    onChanged: (v) =>
-                        update(_s.copyWith(doubleTapLockEnabled: v))),
                 const SizedBox(height: 8),
                 const Text('Navigation position',
                     style: TextStyle(fontWeight: FontWeight.bold)),
@@ -3631,11 +3608,6 @@ class _ReaderPreferencesScreenState extends State<ReaderPreferencesScreen> {
               groupValue: _s.navPosition,
               onChanged: (v) => _update(_s.copyWith(navPosition: v ?? 0)),
             )),
-        _heading('Lock'),
-        _switch('Double-tap to lock / unlock',
-            'When locked, a "Locked" (or "Unlocked") message appears briefly and fades away — it does not stay on screen.',
-            _s.doubleTapLockEnabled,
-            (v) => _update(_s.copyWith(doubleTapLockEnabled: v))),
         _heading('Highlights'),
         _switch(
             'Highlights: long-press a paragraph to highlight it in colour and add a note',
