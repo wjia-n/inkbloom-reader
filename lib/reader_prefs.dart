@@ -90,7 +90,7 @@ class ReaderSettings {
     this.autoNight = false,
     this.nightStartHour = 21,
     this.nightEndHour = 7,
-    this.ttsRate = 0.8,
+    this.ttsRate = 0.6,
     this.ttsPitch = 1.0,
     this.goalMinutes = 30,
     this.languageCode = 'en',
@@ -271,7 +271,7 @@ class ReaderSettings {
       autoNight: b('autoNight', false),
       nightStartHour: i('nightStartHour', 21),
       nightEndHour: i('nightEndHour', 7),
-      ttsRate: d('ttsRate', 0.8),
+      ttsRate: d('ttsRate', 0.6),
       ttsPitch: d('ttsPitch', 1.0),
       goalMinutes: i('goalMinutes', 30),
       customFonts: ((j['customFonts'] as List?) ?? [])

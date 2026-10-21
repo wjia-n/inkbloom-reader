@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import 'extra_screens.dart';
+import 'squishy.dart';
 import 'models.dart';
 
 /// Soft InkBloom look for the two new screens: warm cream
@@ -215,6 +216,9 @@ class _BooksScreenState extends State<BooksScreen> {
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
             child: TextField(
+              autofocus: false,
+              onTapOutside: (_) =>
+                  FocusScope.of(context).unfocus(),
               decoration: InputDecoration(
                 hintText: 'Search books',
                 prefixIcon: const Icon(Icons.search, color: forest),
@@ -287,6 +291,8 @@ class _BooksScreenState extends State<BooksScreen> {
                     ),
                   )
                 : GridView.builder(
+                    keyboardDismissBehavior:
+                        ScrollViewKeyboardDismissBehavior.onDrag,
                     padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
                     gridDelegate:
                         const SliverGridDelegateWithFixedCrossAxisCount(
@@ -357,8 +363,11 @@ class _BooksScreenState extends State<BooksScreen> {
                             ),
                             const SizedBox(height: 4),
                             Center(
-                              child: softCoverWidget(book,
-                                  width: 108, height: 152),
+                              child: Squishy(
+                                onTap: () => widget.onOpen(book),
+                                child: softCoverWidget(book,
+                                    width: 108, height: 152),
+                              ),
                             ),
                             const SizedBox(height: 6),
                             Text(

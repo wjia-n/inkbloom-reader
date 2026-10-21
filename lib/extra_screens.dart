@@ -9,8 +9,13 @@ const forest = Color(0xFF173F35);
 const forestDark = Color(0xFF122E28);
 const terracotta = Color(0xFFE07A5F);
 const cream = Color(0xFFFFF8E7);
+const sage = Color(0xFFA8C3A0);
 
-/// Beautiful InkBloom logo: forest gradient book with a leaf.
+/// New InkBloom logo (2026-10-21, user request: replace the old
+/// icon + splash with a professional one): an open forest book
+/// blooming into a terracotta flower, generated artwork in
+/// assets/inkbloom_logo.png. The same file is the Android
+/// launcher icon (resized per density).
 class InkBloomLogo extends StatelessWidget {
   final double size;
   const InkBloomLogo({super.key, this.size = 96});
@@ -20,11 +25,6 @@ class InkBloomLogo extends StatelessWidget {
       width: size,
       height: size,
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [forest, forestDark],
-        ),
         borderRadius: BorderRadius.circular(size * 0.28),
         boxShadow: [
           BoxShadow(
@@ -34,18 +34,10 @@ class InkBloomLogo extends StatelessWidget {
           ),
         ],
       ),
-      child: Stack(
-        alignment: Alignment.center,
-        children: [
-          Icon(Icons.menu_book_rounded,
-              size: size * 0.52, color: Colors.white),
-          Positioned(
-            right: size * 0.16,
-            top: size * 0.14,
-            child: Icon(Icons.spa_outlined,
-                size: size * 0.24, color: terracotta),
-          ),
-        ],
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(size * 0.28),
+        child: Image.asset('assets/inkbloom_logo.png',
+            width: size, height: size, fit: BoxFit.cover),
       ),
     );
   }
@@ -92,21 +84,21 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: cream,
+      backgroundColor: forestDark,
       body: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const InkBloomLogo(size: 120),
+            const InkBloomLogo(size: 140),
             const SizedBox(height: 24),
-            const Text('InkBloom Reader',
+            const Text('Ink Bloom',
                 style: TextStyle(
-                    fontSize: 28,
+                    fontSize: 32,
                     fontWeight: FontWeight.bold,
-                    color: forest)),
+                    color: Colors.white)),
             const SizedBox(height: 6),
             const Text('Grow your reading habit.',
-                style: TextStyle(color: Colors.grey, fontSize: 16)),
+                style: TextStyle(color: sage, fontSize: 16)),
             const SizedBox(height: 32),
             SizedBox(
               width: 180,
@@ -114,7 +106,7 @@ class _SplashScreenState extends State<SplashScreen> {
                 borderRadius: BorderRadius.circular(4),
                 child: LinearProgressIndicator(
                   value: _progress,
-                  backgroundColor: Colors.grey[300],
+                  backgroundColor: Colors.white24,
                   color: terracotta,
                   minHeight: 5,
                 ),

@@ -17,6 +17,8 @@ import 'extra_screens.dart';
 import 'formats.dart';
 import 'books_screens.dart';
 import 'brightness.dart';
+import 'share_review.dart';
+import 'squishy.dart';
 import 'models.dart';
 import 'reader_prefs.dart';
 import 'stats.dart';
@@ -26,7 +28,6 @@ import 'transfer.dart';
 // deliberately unlike the blue/white look of other readers.
 const forest = Color(0xFF173F35);
 const forestDark = Color(0xFF122E28);
-const sage = Color(0xFFA8C3A0);
 const terracotta = Color(0xFFE07A5F);
 const cream = Color(0xFFFFF8E7);
 
@@ -39,6 +40,11 @@ const highlightColors = <int>[
 ];
 
 void main() => runApp(const InkBloomApp());
+
+/// Watches route changes so the library can dismiss the
+/// keyboard whenever the user comes back to it.
+final RouteObserver<ModalRoute<void>> routeObserver =
+    RouteObserver<ModalRoute<void>>();
 
 class InkBloomApp extends StatelessWidget {
   const InkBloomApp({super.key});
@@ -64,6 +70,7 @@ class InkBloomApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
+      navigatorObservers: [routeObserver],
       home: SplashScreen(home: (_) => const LibraryScreen()),
     );
   }
@@ -146,11 +153,13 @@ class _ToolCard extends StatelessWidget {
       {required this.icon, required this.label, required this.onTap});
   @override
   Widget build(BuildContext context) {
-    return InkWell(
+    return Squishy(
       onTap: onTap,
-      borderRadius: BorderRadius.circular(14),
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 6),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(14),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 6),
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(14),
@@ -165,7 +174,7 @@ class _ToolCard extends StatelessWidget {
               style: const TextStyle(fontSize: 11)),
         ]),
       ),
-    );
+    ));
   }
 }
 
@@ -177,7 +186,7 @@ class LibraryScreen extends StatefulWidget {
   State<LibraryScreen> createState() => _LibraryScreenState();
 }
 
-class _LibraryScreenState extends State<LibraryScreen> {
+class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
   List<LibraryBook> _books = [];
   ReaderSettings _settings = const ReaderSettings();
   ReadingStats _stats = const ReadingStats();
@@ -186,6 +195,29 @@ class _LibraryScreenState extends State<LibraryScreen> {
   String _shelfFilter = 'All';
   bool _grid = true;
   bool _loading = true;
+  final _searchFocus = FocusNode();
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route != null) routeObserver.subscribe(this, route);
+  }
+
+  @override
+  void didPopNext() {
+    // Coming back to the main screen must never pop the
+    // keyboard up for a search the user did not ask for.
+    _searchFocus.unfocus();
+    FocusScope.of(context).unfocus();
+  }
+
+  @override
+  void dispose() {
+    routeObserver.unsubscribe(this);
+    _searchFocus.dispose();
+    super.dispose();
+  }
 
   @override
   void initState() {
@@ -697,6 +729,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
       _persist();
       book = moved;
     }
+    final readStart = DateTime.now();
     final updated = await Navigator.push<LibraryBook>(
       context,
       MaterialPageRoute(
@@ -708,6 +741,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
       ),
     );
     if (updated != null) _updateBook(updated);
+    // Support / share / review prompts: only after a real
+    // read (5+ minutes in this book), at most one per day,
+    // never twice after "Don't show again". Never on open,
+    // never mid-read, never annoying.
+    final readSeconds = DateTime.now().difference(readStart).inSeconds;
+    if (readSeconds >= 300 && mounted) {
+      await _maybeShowClosePopup();
+    }
     // Refresh stats: the reader records minutes while you read,
     // but the library card was showing the old totals until the
     // app restarted. Reload them the moment you come back.
@@ -717,6 +758,86 @@ class _LibraryScreenState extends State<LibraryScreen> {
         _stats =
             ReadingStats.fromJsonString(prefs.getString('inkbloom_stats'));
       });
+    }
+  }
+
+  Future<void> _maybeShowClosePopup() async {
+    final prefs = await SharedPreferences.getInstance();
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+    if (prefs.getString('inkbloom_popup_last_date') == today) return;
+    var closes = prefs.getInt('inkbloom_popup_close_count') ?? 0;
+    closes++;
+    await prefs.setInt('inkbloom_popup_close_count', closes);
+    if (!(prefs.getBool('inkbloom_popup_dont_support') ?? false)) {
+      await prefs.setString('inkbloom_popup_last_date', today);
+      if (!mounted) return;
+      final action = await showDialog<String>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Enjoying InkBloom?'),
+          content: const Text(
+              'If this app makes reading better for you, a small tip keeps it growing. Totally optional — and it unlocks nothing, it is just a thank-you.'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context, 'coffee'),
+                child: const Text('Buy me a coffee')),
+            TextButton(
+                onPressed: () => Navigator.pop(context, 'headphone'),
+                child: const Text('Buy me a headphone')),
+            TextButton(
+                onPressed: () => Navigator.pop(context, 'later'),
+                child: const Text('Not now')),
+            TextButton(
+                onPressed: () => Navigator.pop(context, 'never'),
+                child: const Text("Don't show again")),
+          ],
+        ),
+      );
+      if (action == 'never') {
+        await prefs.setBool('inkbloom_popup_dont_support', true);
+      } else if (action == 'coffee' || action == 'headphone') {
+        if (mounted) {
+          await Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const SupportScreen()),
+          );
+        }
+      }
+      return;
+    }
+    if (!(prefs.getBool('inkbloom_popup_dont_share') ?? false) &&
+        closes % 3 == 0) {
+      await prefs.setString('inkbloom_popup_last_date', today);
+      if (!mounted) return;
+      final action = await showDialog<String>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Tell a reader?'),
+          content: const Text(
+              'If InkBloom is earning its place on your phone, sharing it with one friend — or a quick rating — helps more than you would think.'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context, 'share'),
+                child: const Text('Share InkBloom')),
+            TextButton(
+                onPressed: () => Navigator.pop(context, 'rate'),
+                child: const Text('Rate on Play Store')),
+            TextButton(
+                onPressed: () => Navigator.pop(context, 'later'),
+                child: const Text('Not now')),
+            TextButton(
+                onPressed: () => Navigator.pop(context, 'never'),
+                child: const Text("Don't show again")),
+          ],
+        ),
+      );
+      if (action == 'never') {
+        await prefs.setBool('inkbloom_popup_dont_share', true);
+      } else if (action == 'share') {
+        await shareApp();
+      } else if (action == 'rate') {
+        await reviewApp();
+      }
     }
   }
 
@@ -936,7 +1057,10 @@ class _LibraryScreenState extends State<LibraryScreen> {
           // one page, so the header scrolls away and the grid
           // gets the full screen instead of a squeezed strip at
           // the bottom (user complaint 2026-10-21).
-          : CustomScrollView(slivers: [
+          : CustomScrollView(
+              keyboardDismissBehavior:
+                  ScrollViewKeyboardDismissBehavior.onDrag,
+              slivers: [
               SliverToBoxAdapter(
                 child: Column(children: [
               // ── Stitch reference: "Warm Paper Editorial" library ──
@@ -1090,6 +1214,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
                 child: TextField(
+                  focusNode: _searchFocus,
+                  autofocus: false,
+                  onTapOutside: (_) => _searchFocus.unfocus(),
                   onChanged: (v) => setState(() => _query = v),
                   decoration: InputDecoration(
                     hintText: lang.t('searchHint'),
@@ -1398,7 +1525,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
 
   Widget _gridCard(LibraryBook book) {
     final pct = (book.progress * 100).round();
-    return Card(
+    return Squishy(
+      onTap: () => _openBook(book),
+      child: Card(
       color: Colors.white,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       clipBehavior: Clip.antiAlias,
@@ -1474,7 +1603,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
           ],
         ),
       ),
-    );
+    ));
   }
 
   Widget _listCard(LibraryBook book) {
@@ -1844,7 +1973,7 @@ class AppSettingsScreen extends StatelessWidget {
                     ? 'Voice: device default'
                     : 'Voice: ${settings.ttsVoiceName}'),
               ),
-              _sliderTile('Speech speed', settings.ttsRate, 0.5, 1.5,
+              _sliderTile('Speech speed', settings.ttsRate, 0.3, 1.5,
                   (v) => onSettingsChanged(settings.copyWith(ttsRate: v))),
               _sliderTile('Speech pitch', settings.ttsPitch, 0.5, 2.0,
                   (v) => onSettingsChanged(settings.copyWith(ttsPitch: v))),
@@ -2011,6 +2140,24 @@ class ReaderScreen extends StatefulWidget {
   State<ReaderScreen> createState() => _ReaderScreenState();
 }
 
+/// Small centred hint shown once, on the very first book
+/// open, while the controls are hidden.
+class _TapHint extends StatelessWidget {
+  const _TapHint();
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(24),
+      ),
+      child: const Text('Tap the page to show controls',
+          style: TextStyle(color: Colors.white, fontSize: 15)),
+    );
+  }
+}
+
 class _ReaderScreenState extends State<ReaderScreen> {
   late ReaderSettings _s;
   late int _chapter;
@@ -2024,7 +2171,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
   String _searchTerm = '';
   List<SearchHit> _searchHits = [];
   int _searchHitIndex = 0;
-  final Map<int, GlobalKey> _paraKeys = {};
+  final Map<String, GlobalKey> _paraKeys = {};
+  final Map<int, GlobalKey> _chapterKeys = {};
+  bool _showTapHint = true;
   final _scroll = ScrollController();
   final _pageController = PageController();
   final _scaffoldKey = GlobalKey<ScaffoldState>();
@@ -2039,12 +2188,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void initState() {
     super.initState();
     _s = widget.settings;
+    // Controls start HIDDEN: the page is clean on open, and
+    // a single tap brings the bars, the -/+ pill and the
+    // chapter bar up. Nothing sits on the text otherwise.
+    _barsVisible = false;
     applyBrightness(_s.brightness);
     _chapter =
         widget.book.lastChapter.clamp(0, widget.book.chapters.length - 1);
     _bookmarks = [...widget.book.bookmarks];
     _highlights = [...widget.book.highlights];
-    _barsVisible = true;
     _applySystemUi();
     _lastTick = DateTime.now();
     _loadReaderExtras();
@@ -2060,6 +2212,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
     setState(() {
+      _showTapHint = !(prefs.getBool('inkbloom_tap_hint_shown') ?? false);
       _stats =
           ReadingStats.fromJsonString(prefs.getString('inkbloom_stats'));
       try {
@@ -2093,7 +2246,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
     } else {
       await _tts.setLanguage('en-US');
     }
-    final text = widget.book.chapters[_chapter].paragraphs.join(' ');
+    // Pauses between paragraphs: joining with spaces made
+    // even a slow speed feel like one breathless rush.
+    final text =
+        widget.book.chapters[_chapter].paragraphs.join('\n\n');
     final result = await _tts.speak(text);
     if (mounted) setState(() => _isSpeaking = result == 1);
   }
@@ -2107,7 +2263,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void dispose() {
     _statsTimer?.cancel();
     _recordReadingTime();
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
+        overlays: SystemUiOverlay.values);
     resetBrightness();
     _tts.stop();
     _scroll.dispose();
@@ -2121,7 +2278,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
   /// the page. Bars visible = normal edge-to-edge again.
   void _applySystemUi() {
     if (_barsVisible) {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      // Normal mode: system bars opaque, content padded above
+      // them — the old edge-to-edge mode pushed the chapter
+      // bar and the -/+ pill under the system navigation bar.
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
+          overlays: SystemUiOverlay.values);
     } else {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     }
@@ -2156,7 +2317,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
       _chapter = hit.chapter;
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      final key = _paraKeys[hit.paragraph];
+      final key = _paraKeys['${hit.chapter}:${hit.paragraph}'];
       final ctx = key?.currentContext;
       if (ctx != null) Scrollable.ensureVisible(ctx, duration: const Duration(milliseconds: 300));
     });
@@ -2168,14 +2329,48 @@ class _ReaderScreenState extends State<ReaderScreen> {
     if (chapter < 0 || chapter >= widget.book.chapters.length) return;
     setState(() {
       _chapter = chapter;
+    });
+    if (_s.readingMode == 0) {
+      // Continuous scroll: jump to this chapter's heading.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final key = _chapterKeys[chapter];
+        final ctx = key?.currentContext;
+        if (ctx != null) Scrollable.ensureVisible(ctx,
+            duration: const Duration(milliseconds: 300));
       });
+      return;
+    }
     if (_scroll.hasClients) _scroll.jumpTo(0);
     if (_pageController.hasClients) _pageController.jumpToPage(0);
   }
 
+  /// In continuous scroll mode, the chapter shown in the bar
+  /// follows the heading nearest the top of the screen.
+  void _updateChapterFromScroll() {
+    if (_s.readingMode != 0 || !_scroll.hasClients) return;
+    var found = _chapter;
+    for (var i = 0; i < widget.book.chapters.length; i++) {
+      final ctx = _chapterKeys[i]?.currentContext;
+      if (ctx == null) continue;
+      final box = ctx.findRenderObject() as RenderBox?;
+      if (box == null || !box.hasSize) continue;
+      final dy = box.localToGlobal(Offset.zero).dy;
+      if (dy <= 140) found = i;
+    }
+    if (found != _chapter && mounted) setState(() => _chapter = found);
+  }
+
   LibraryBook _bookToReturn() {
     final total = widget.book.chapters.length;
-    final progress = total <= 1 ? 1.0 : _chapter / (total - 1);
+    double progress;
+    if (_s.readingMode == 0 &&
+        _scroll.hasClients &&
+        _scroll.position.maxScrollExtent > 0) {
+      progress = (_scroll.offset / _scroll.position.maxScrollExtent)
+          .clamp(0.0, 1.0);
+    } else {
+      progress = total <= 1 ? 1.0 : _chapter / (total - 1);
+    }
     return widget.book.copyWith(
       progress: progress,
       lastChapter: _chapter,
@@ -2242,7 +2437,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
       );
     }
     return KeyedSubtree(
-      key: _paraKeys.putIfAbsent(paraIdx, () => GlobalKey()),
+      key: _paraKeys.putIfAbsent('$chapterIdx:$paraIdx', () => GlobalKey()),
       child: GestureDetector(
       onLongPress: _s.enableHighlights
           ? () => _guarded(() => _highlightSheet(chapterIdx, paraIdx, hl, text))
@@ -2600,8 +2795,61 @@ class _ReaderScreenState extends State<ReaderScreen> {
         ),
       );
     }
-    // Continuous scroll (mode 0) and horizontal scroll (mode 2 uses
-    // the same list; swipe paging is mode 1).
+    // Continuous scroll (mode 0): the WHOLE book in one
+    // list, chapter after chapter, so scrolling never stops
+    // dead at the end of a short chapter. A "Next chapter"
+    // button sits at each chapter's end for readers who
+    // prefer jumping. (Mode 2, horizontal scroll, keeps the
+    // old single-chapter list.)
+    if (_s.readingMode == 0) {
+      final all = <Widget>[];
+      for (var ci = 0; ci < widget.book.chapters.length; ci++) {
+        final ch = widget.book.chapters[ci];
+        all.add(Text(ch.title,
+            key: _chapterKeys.putIfAbsent(ci, () => GlobalKey()),
+            style: TextStyle(
+                color: theme.fg,
+                fontSize: _s.fontSize + 6,
+                fontWeight: FontWeight.bold,
+                height: 1.3)));
+        all.add(const SizedBox(height: 20));
+        for (var pi = 0; pi < ch.paragraphs.length; pi++) {
+          all.add(Padding(
+            padding: EdgeInsets.only(bottom: _s.paragraphSpacing),
+            child: _paragraphWidget(ci, pi, ch.paragraphs[pi]),
+          ));
+        }
+        all.add(const SizedBox(height: 24));
+        if (ci < widget.book.chapters.length - 1) {
+          all.add(Center(
+            child: FilledButton.icon(
+              onPressed: () => _go(ci + 1),
+              icon: const Icon(Icons.arrow_forward),
+              label: Text(
+                  'Next chapter: ${widget.book.chapters[ci + 1].title}'),
+            ),
+          ));
+          all.add(const SizedBox(height: 24));
+        } else {
+          all.add(Center(
+            child: Text('— End of book —',
+                style: TextStyle(color: theme.fg.withValues(alpha: 0.6))),
+          ));
+        }
+      }
+      return NotificationListener<ScrollNotification>(
+        onNotification: (_) {
+          _updateChapterFromScroll();
+          return false;
+        },
+        child: ListView(
+          controller: _scroll,
+          padding: EdgeInsets.all(_s.pageMargin),
+          children: all,
+        ),
+      );
+    }
+    // Single-chapter list (horizontal scroll, mode 2).
     return ListView(
       controller: _scroll,
       padding: EdgeInsets.all(_s.pageMargin),
@@ -2794,7 +3042,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
       body: Builder(
         builder: (scaffoldContext) => GestureDetector(
           onTap: _s.autoHideBars
-              ? () => _setBarsVisible(!_barsVisible)
+              ? () async {
+                  if (_showTapHint) {
+                    setState(() => _showTapHint = false);
+                    final prefs = await SharedPreferences.getInstance();
+                    await prefs.setBool(
+                        'inkbloom_tap_hint_shown', true);
+                  }
+                  _setBarsVisible(!_barsVisible);
+                }
               : null,
           child: Stack(children: [
             Column(children: [
@@ -2877,35 +3133,53 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   child: _chapterBar(),
                 ),
               ),
+            // First-run hint: the page starts clean, so tell
+            // the reader once how to bring controls back.
+            if (_showTapHint && !showBars)
+              const IgnorePointer(
+                child: Center(
+                  child: _TapHint(),
+                ),
+              ),
             // Text size - / + buttons: hideable in Reader preferences.
+            // Coloured terracotta, not grey, and pinned to the
+            // bottom-right corner: above the bottom chapter bar
+            // AND above the floating pill bar, never overlapping
+            // either (the old code forgot the floating case).
             if (_s.showTextSizeButtons && showBars)
               Positioned(
                 right: 16,
-                bottom: (_s.showBottomBar && _s.navPosition == 0)
+                bottom: (_s.showBottomBar &&
+                        (_s.navPosition == 0 || _s.navPosition == 2))
                     ? 88
                     : 16,
-                child: Card(
-                  elevation: 4,
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(24)),
-                  child: Row(mainAxisSize: MainAxisSize.min, children: [
-                    IconButton(
-                      icon: const Icon(Icons.remove),
-                      tooltip: 'Smaller text',
-                      onPressed: () => _guarded(() => _setSettings(
-                          _s.copyWith(
-                              fontSize: (_s.fontSize - 1).clamp(12.0, 32.0)))),
-                    ),
-                    Text('${_s.fontSize.round()}',
-                        style: const TextStyle(fontWeight: FontWeight.bold)),
-                    IconButton(
-                      icon: const Icon(Icons.add),
-                      tooltip: 'Bigger text',
-                      onPressed: () => _guarded(() => _setSettings(
-                          _s.copyWith(
-                              fontSize: (_s.fontSize + 1).clamp(12.0, 32.0)))),
-                    ),
-                  ]),
+                child: Squishy(
+                  child: Card(
+                    elevation: 6,
+                    color: terracotta,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(24)),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      IconButton(
+                        icon: const Icon(Icons.remove, color: Colors.white),
+                        tooltip: 'Smaller text',
+                        onPressed: () => _guarded(() => _setSettings(
+                            _s.copyWith(
+                                fontSize: (_s.fontSize - 1).clamp(12.0, 32.0)))),
+                      ),
+                      Text('${_s.fontSize.round()}',
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white)),
+                      IconButton(
+                        icon: const Icon(Icons.add, color: Colors.white),
+                        tooltip: 'Bigger text',
+                        onPressed: () => _guarded(() => _setSettings(
+                            _s.copyWith(
+                                fontSize: (_s.fontSize + 1).clamp(12.0, 32.0)))),
+                      ),
+                    ]),
+                  ),
                 ),
               ),
             // Edge tap zones, when enabled: left edge = previous
@@ -3067,12 +3341,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 const SizedBox(height: 8),
                 const Text('Read aloud',
                     style: TextStyle(fontWeight: FontWeight.bold)),
-                _sliderRow('Speech speed', _s.ttsRate, 0.5, 2.0,
+                _sliderRow('Speech speed', _s.ttsRate, 0.3, 2.0,
                     (v) => update(_s.copyWith(ttsRate: v))),
                 _sliderRow('Speech pitch', _s.ttsPitch, 0.5, 2.0,
                     (v) => update(_s.copyWith(ttsPitch: v))),
                 const Text(
-                    'Tap the speaker icon in the top bar to start or stop reading aloud. Speed and pitch apply to the next chapter you play.'),
+                    'Tap the speaker icon in the top bar to start or stop reading aloud. Speed and pitch apply right away, even while a chapter is playing.'),
                 const SizedBox(height: 8),
                 const Text('Alignment',
                     style: TextStyle(fontWeight: FontWeight.bold)),
@@ -3556,7 +3830,7 @@ class _ReaderPreferencesScreenState extends State<ReaderPreferencesScreen> {
           const Expanded(
               child: Text('Speed is saved and locked for all books until you change it.')),
         ]),
-        _slider('Speech speed', _s.ttsRate, 0.5, 1.5,
+        _slider('Speech speed', _s.ttsRate, 0.3, 1.5,
             (v) => _update(_s.copyWith(ttsRate: v))),
         _slider('Speech pitch', _s.ttsPitch, 0.5, 2.0,
             (v) => _update(_s.copyWith(ttsPitch: v))),
