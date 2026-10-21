@@ -105,13 +105,25 @@ class BookParser {
   /// PDF from raw bytes (used by the isolate import path, which has
   /// no File access on the worker side).
   static ParsedBook parsePdfBytes(Uint8List bytes, String fileName) {
-    final title = _fileTitle(fileName);
+    // The PDF's own metadata wins over the filename: a file
+    // downloaded as "book_17925970589_10922_0.pdf" shows its
+    // real title, not its numeric download name. The app never
+    // renames the file itself — this is only the display title.
+    final meta = extractPdfMeta(bytes);
+    final title = meta.title ?? _fileTitle(fileName);
     final text = extractPdfTextFallback(bytes);
     if (text.isEmpty) {
       throw const FormatException(
           'Could not read this PDF. Scanned/image PDFs have no text to extract.');
     }
-    return _parseTxt(title, text).copyFormat('pdf');
+    final parsed = _parseTxt(title, text);
+    return ParsedBook(
+      title: title,
+      author: meta.author ?? 'Unknown Author',
+      format: 'pdf',
+      chapters: parsed.chapters,
+      coverBytes: extractPdfCover(bytes),
+    );
   }
 
   /// Word .docx: ZIP, text lives in word/document.xml as

@@ -299,8 +299,11 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         'inkbloom_library_v2', jsonEncode(_books.map((b) => b.toJson()).toList()));
     await prefs.setString(
         'inkbloom_settings', jsonEncode(_settings.toJson()));
-    await prefs.setString(
-        'inkbloom_stats', jsonEncode(_stats.toJson()));
+    // NOTE: stats are deliberately NOT written here. The
+    // library's _stats is a snapshot from before the reader
+    // opened; writing it would wipe the minutes the reader
+    // just recorded (the "goal never moves" bug). The reader
+    // owns 'inkbloom_stats' and writes it itself.
   }
 
   void _updateSettings(ReaderSettings s) {
@@ -740,6 +743,16 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         ),
       ),
     );
+    // Refresh stats FIRST, before _updateBook persists the
+    // library: the reader recorded minutes while you read, and
+    // the library must not persist its stale snapshot over them.
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) {
+      setState(() {
+        _stats =
+            ReadingStats.fromJsonString(prefs.getString('inkbloom_stats'));
+      });
+    }
     if (updated != null) _updateBook(updated);
     // Support / share / review prompts: only after a real
     // read (5+ minutes in this book), at most one per day,
@@ -748,16 +761,6 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     final readSeconds = DateTime.now().difference(readStart).inSeconds;
     if (readSeconds >= 300 && mounted) {
       await _maybeShowClosePopup();
-    }
-    // Refresh stats: the reader records minutes while you read,
-    // but the library card was showing the old totals until the
-    // app restarted. Reload them the moment you come back.
-    final prefs = await SharedPreferences.getInstance();
-    if (mounted) {
-      setState(() {
-        _stats =
-            ReadingStats.fromJsonString(prefs.getString('inkbloom_stats'));
-      });
     }
   }
 
@@ -3039,8 +3042,17 @@ class _ReaderScreenState extends State<ReaderScreen> {
           (_s.showBottomBar && showBars && _s.navPosition == 0)
               ? _chapterBar()
               : null,
-      body: Builder(
-        builder: (scaffoldContext) => GestureDetector(
+      // System back button must save progress too, not just the
+      // AppBar back arrow: without this, closing a book with
+      // the phone's back button popped with null and the
+      // library kept showing "Not started".
+      body: PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop) Navigator.pop(context, _bookToReturn());
+        },
+        child: Builder(
+          builder: (scaffoldContext) => GestureDetector(
           onTap: _s.autoHideBars
               ? () async {
                   if (_showTapHint) {
@@ -3141,27 +3153,31 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   child: _TapHint(),
                 ),
               ),
-            // Text size - / + buttons: hideable in Reader preferences.
-            // Coloured terracotta, not grey, and pinned to the
-            // bottom-right corner: above the bottom chapter bar
-            // AND above the floating pill bar, never overlapping
-            // either (the old code forgot the floating case).
+            // Text size - / + buttons, Neat-style (user
+            // reference, 2026-10-21): a small white pill in the
+            // exact bottom-right corner, just above the bottom
+            // bar — NOT floating 88px above it. The bottom bar
+            // is the Scaffold's bottomNavigationBar, OUTSIDE
+            // this Stack, so the Stack's own bottom edge is
+            // already the bar's top edge: bottom 16 sits the
+            // pill right on the bar. Only the floating pill
+            // bar (navPosition 2) lives INSIDE this Stack, so
+            // only it needs the 88px clearance.
             if (_s.showTextSizeButtons && showBars)
               Positioned(
                 right: 16,
-                bottom: (_s.showBottomBar &&
-                        (_s.navPosition == 0 || _s.navPosition == 2))
+                bottom: (_s.showBottomBar && _s.navPosition == 2)
                     ? 88
                     : 16,
                 child: Squishy(
                   child: Card(
                     elevation: 6,
-                    color: terracotta,
+                    color: Colors.white,
                     shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(24)),
                     child: Row(mainAxisSize: MainAxisSize.min, children: [
                       IconButton(
-                        icon: const Icon(Icons.remove, color: Colors.white),
+                        icon: const Icon(Icons.remove, color: forest),
                         tooltip: 'Smaller text',
                         onPressed: () => _guarded(() => _setSettings(
                             _s.copyWith(
@@ -3169,10 +3185,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
                       ),
                       Text('${_s.fontSize.round()}',
                           style: const TextStyle(
-                              fontWeight: FontWeight.bold,
-                              color: Colors.white)),
+                              fontWeight: FontWeight.bold, color: forest)),
                       IconButton(
-                        icon: const Icon(Icons.add, color: Colors.white),
+                        icon: const Icon(Icons.add, color: forest),
                         tooltip: 'Bigger text',
                         onPressed: () => _guarded(() => _setSettings(
                             _s.copyWith(
@@ -3212,6 +3227,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
           ]),
         ),
       ),
+    ),
     );
   }
 

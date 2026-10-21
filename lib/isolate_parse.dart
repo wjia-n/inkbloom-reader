@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 import 'epub_parser.dart';
 import 'formats.dart';
+import 'pdf_extract.dart';
 
 /// Parses a book OFF the UI thread.
 ///
@@ -56,6 +57,11 @@ ParsedBook parsedBookFromIsolate(Map<String, dynamic> m) {
 Map<String, dynamic> coverBookIsolate(Map<String, dynamic> args) {
   final name = (args['name'] as String).toLowerCase();
   final bytes = args['bytes'] as Uint8List;
-  if (!name.endsWith('.epub')) return {'cover': null};
-  return {'cover': EpubParser.coverBytesOnly(bytes)};
+  if (name.endsWith('.epub')) {
+    return {'cover': EpubParser.coverBytesOnly(bytes)};
+  }
+  if (name.endsWith('.pdf')) {
+    return {'cover': extractPdfCover(bytes)};
+  }
+  return {'cover': null};
 }
