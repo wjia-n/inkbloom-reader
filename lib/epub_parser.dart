@@ -38,6 +38,41 @@ class EpubParser {
       return null;
     }
 
+    // Normalise an OPF href: decode %20 etc, drop #fragment,
+    // resolve ./ and ../ against the OPF directory, and fall
+    // back to matching by file name alone. Real EPUBs in the
+    // wild use all of these, and an exact-path miss used to
+    // make a perfectly good book open as "no chapters".
+    String normHref(String href, String dir) {
+      var h = Uri.decodeFull(href);
+      final hash = h.indexOf('#');
+      if (hash >= 0) h = h.substring(0, hash);
+      if (h.startsWith('/')) h = h.substring(1);
+      final parts = <String>[];
+      for (final seg in (dir + h).split('/')) {
+        if (seg.isEmpty || seg == '.') continue;
+        if (seg == '..') {
+          if (parts.isNotEmpty) parts.removeLast();
+        } else {
+          parts.add(seg);
+        }
+      }
+      return parts.join('/');
+    }
+
+    ArchiveFile? findHref(String href, String dir) {
+      final norm = normHref(href, dir);
+      return find(norm) ??
+          find(href) ??
+          find(dir + href) ??
+          archive.files
+              .where((f) => f.name.endsWith('/${norm.split('/').last}'))
+              .firstOrNull ??
+          archive.files
+              .where((f) => f.name.endsWith(norm.split('/').last))
+              .firstOrNull;
+    }
+
     ArchiveFile? findSuffix(String suffix) {
       for (final f in archive.files) {
         if (f.name.endsWith(suffix)) return f;
@@ -50,7 +85,11 @@ class EpubParser {
     final container = find('META-INF/container.xml');
     if (container != null) {
       try {
-        final doc = XmlDocument.parse(utf8.decode(container.content));
+        var containerText = utf8.decode(container.content, allowMalformed: true);
+        if (containerText.startsWith('\uFEFF')) {
+          containerText = containerText.substring(1);
+        }
+        final doc = XmlDocument.parse(containerText);
         final rootfile = doc.findAllElements('rootfile').firstOrNull;
         opfPath = rootfile?.getAttribute('full-path') ?? '';
       } catch (_) {}
@@ -64,7 +103,9 @@ class EpubParser {
         ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1)
         : '';
 
-    final opf = XmlDocument.parse(utf8.decode(opfFile.content));
+    var opfText = utf8.decode(opfFile.content, allowMalformed: true);
+    if (opfText.startsWith('\uFEFF')) opfText = opfText.substring(1);
+    final opf = XmlDocument.parse(opfText);
     String meta(String tag) {
       final el = opf.findAllElements(tag).firstOrNull;
       return el?.innerText.trim() ?? '';
@@ -89,29 +130,55 @@ class EpubParser {
       }
     }
 
-    // 3. Cover: properties="cover-image" wins, then id="cover".
+    // 3. Cover, in order — this is why imported books used to
+    // show no thumbnail even though the EPUB had one:
+    //  a) properties="cover-image" (EPUB 3)
+    //  b) <meta name="cover" content="..."> (EPUB 2, the most common)
+    //  c) an id or file name containing "cover"
+    //  d) the first image in the manifest (better than no cover)
     Uint8List? coverBytes;
     for (final entry in manifest.values) {
-      if (entry.props.contains('cover-image') ||
-          entry.type.startsWith('image/')) {
-        // Only take the first image if it looks like a cover; keep it cheap.
-        if (entry.props.contains('cover-image')) {
-          final f = find(opfDir + entry.href) ?? find(entry.href);
-          if (f != null) {
-            coverBytes = Uint8List.fromList(f.content);
-            break;
-          }
+      if (entry.props.contains('cover-image')) {
+        final f = findHref(entry.href, opfDir);
+        if (f != null) {
+          coverBytes = Uint8List.fromList(f.content);
+          break;
         }
       }
     }
     coverBytes ??= () {
-      final coverId = manifest.entries
-          .where((e) => e.key.toLowerCase().contains('cover'))
-          .firstOrNull;
-      if (coverId != null) {
-        final f = find(opfDir + coverId.value.href);
-        if (f != null && coverId.value.type.startsWith('image/')) {
-          return Uint8List.fromList(f.content);
+      for (final metaEl in opf.findAllElements('meta')) {
+        if (metaEl.getAttribute('name')?.toLowerCase() == 'cover') {
+          final id = metaEl.getAttribute('content');
+          final entry = id == null ? null : manifest[id];
+          if (entry != null) {
+            final f = findHref(entry.href, opfDir);
+            if (f != null) return Uint8List.fromList(f.content);
+          }
+        }
+      }
+      return null;
+    }();
+    coverBytes ??= () {
+      for (final e in manifest.entries) {
+        if (e.key.toLowerCase().contains('cover') &&
+            e.value.type.startsWith('image/')) {
+          final f = findHref(e.value.href, opfDir);
+          if (f != null) return Uint8List.fromList(f.content);
+        }
+      }
+      for (final e in manifest.values) {
+        if (e.type.startsWith('image/') &&
+            e.href.toLowerCase().contains('cover')) {
+          final f = findHref(e.href, opfDir);
+          if (f != null) return Uint8List.fromList(f.content);
+        }
+      }
+      // Last resort: the first image in the book.
+      for (final e in manifest.values) {
+        if (e.type.startsWith('image/')) {
+          final f = findHref(e.href, opfDir);
+          if (f != null) return Uint8List.fromList(f.content);
         }
       }
       return null;
@@ -130,7 +197,7 @@ class EpubParser {
           !entry.href.endsWith('.htm')) {
         continue;
       }
-      final file = find(opfDir + entry.href) ?? find(entry.href);
+      final file = findHref(entry.href, opfDir);
       if (file == null) continue;
       final html = utf8.decode(file.content, allowMalformed: true);
       final blocks = htmlToBlocks(html);
@@ -155,6 +222,83 @@ class EpubParser {
       chapters: chapters,
       coverBytes: coverBytes,
     );
+  }
+
+  /// Cover only, without parsing chapters. Used when chapter
+  /// parsing fails: the book still gets its real thumbnail.
+  static Uint8List? coverBytesOnly(Uint8List bytes) {
+    try {
+      final archive = ZipDecoder().decodeBytes(bytes);
+      ArchiveFile? find(String path) {
+        for (final f in archive.files) {
+          if (f.name == path) return f;
+        }
+        return null;
+      }
+      String opfPath = '';
+      final container = find('META-INF/container.xml');
+      if (container != null) {
+        try {
+          final doc = XmlDocument.parse(
+              utf8.decode(container.content, allowMalformed: true));
+          opfPath =
+              doc.findAllElements('rootfile').firstOrNull?.getAttribute('full-path') ?? '';
+        } catch (_) {}
+      }
+      ArchiveFile? opfFile = opfPath.isNotEmpty
+          ? find(opfPath)
+          : archive.files.where((f) => f.name.endsWith('.opf')).firstOrNull;
+      if (opfFile == null) return null;
+      final opfDir = opfPath.contains('/')
+          ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1)
+          : '';
+      final opf = XmlDocument.parse(
+          utf8.decode(opfFile.content, allowMalformed: true));
+      final manifest = <String, ({String href, String type, String props})>{};
+      for (final item in opf.findAllElements('item')) {
+        final id = item.getAttribute('id');
+        final href = item.getAttribute('href');
+        if (id != null && href != null) {
+          manifest[id] = (
+            href: href,
+            type: item.getAttribute('media-type') ?? '',
+            props: item.getAttribute('properties') ?? '',
+          );
+        }
+      }
+      ArchiveFile? byHref(String href) {
+        final norm = href.replaceAll('%20', ' ');
+        return find(opfDir + norm) ??
+            find(norm) ??
+            archive.files
+                .where((f) => f.name.endsWith(norm.split('/').last))
+                .firstOrNull;
+      }
+      for (final e in manifest.values) {
+        if (e.props.contains('cover-image')) {
+          final f = byHref(e.href);
+          if (f != null) return Uint8List.fromList(f.content);
+        }
+      }
+      for (final metaEl in opf.findAllElements('meta')) {
+        if (metaEl.getAttribute('name')?.toLowerCase() == 'cover') {
+          final entry = manifest[metaEl.getAttribute('content')];
+          if (entry != null) {
+            final f = byHref(entry.href);
+            if (f != null) return Uint8List.fromList(f.content);
+          }
+        }
+      }
+      for (final e in manifest.values) {
+        if (e.type.startsWith('image/')) {
+          final f = byHref(e.href);
+          if (f != null) return Uint8List.fromList(f.content);
+        }
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
   }
 }
 

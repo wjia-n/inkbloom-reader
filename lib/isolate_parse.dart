@@ -50,3 +50,12 @@ ParsedBook parsedBookFromIsolate(Map<String, dynamic> m) {
     coverBytes: m['cover'] as Uint8List?,
   );
 }
+
+/// Cover-only isolate: used when chapter parsing fails, so the
+/// book still gets its real thumbnail instead of a generated cover.
+Map<String, dynamic> coverBookIsolate(Map<String, dynamic> args) {
+  final name = (args['name'] as String).toLowerCase();
+  final bytes = args['bytes'] as Uint8List;
+  if (!name.endsWith('.epub')) return {'cover': null};
+  return {'cover': EpubParser.coverBytesOnly(bytes)};
+}

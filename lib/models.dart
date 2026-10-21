@@ -54,6 +54,7 @@ class LibraryBook {
   final bool isFavourite;
   final List<String> tags;
   final DateTime addedAt;
+  final DateTime? lastReadAt; // null = never opened
 
   const LibraryBook({
     required this.id,
@@ -72,6 +73,7 @@ class LibraryBook {
     this.isFavourite = false,
     this.tags = const [],
     required this.addedAt,
+    this.lastReadAt,
   });
 
   bool get isBuiltin => filePath == null;
@@ -90,6 +92,7 @@ class LibraryBook {
     String? shelf,
     bool? isFavourite,
     List<String>? tags,
+    DateTime? lastReadAt,
   }) =>
       LibraryBook(
         id: id,
@@ -108,6 +111,7 @@ class LibraryBook {
         isFavourite: isFavourite ?? this.isFavourite,
         tags: tags ?? this.tags,
         addedAt: addedAt,
+        lastReadAt: lastReadAt ?? this.lastReadAt,
       );
 
   Map<String, dynamic> toJson() => {
@@ -126,6 +130,7 @@ class LibraryBook {
         'isFavourite': isFavourite,
         'tags': tags,
         'addedAt': addedAt.toIso8601String(),
+        'lastReadAt': lastReadAt?.toIso8601String(),
       };
 
   static LibraryBook? fromJson(Map<String, dynamic> j) {
@@ -153,6 +158,8 @@ class LibraryBook {
         tags: ((j['tags'] as List?) ?? []).map((e) => e.toString()).toList(),
         addedAt: DateTime.tryParse(j['addedAt'] as String? ?? '') ??
             DateTime.now(),
+        lastReadAt:
+            DateTime.tryParse(j['lastReadAt'] as String? ?? ''),
       );
     } catch (_) {
       return null;

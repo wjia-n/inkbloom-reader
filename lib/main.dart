@@ -14,6 +14,7 @@ import 'isolate_parse.dart';
 import 'dictionary.dart';
 import 'extra_screens.dart';
 import 'formats.dart';
+import 'books_screens.dart';
 import 'models.dart';
 import 'reader_prefs.dart';
 import 'stats.dart';
@@ -440,6 +441,27 @@ class _LibraryScreenState extends State<LibraryScreen> {
       });
       await _persist();
     } catch (_) {
+      // Chapter parsing failed, but the book is NOT lost — and
+      // it should still get its real cover. Try cover-only:
+      // most "no cover, won't open" EPUBs have a perfectly
+      // good cover image even when their text is unusual.
+      try {
+        final cover = await compute(
+                coverBookIsolate, {'name': name, 'bytes': bytes})
+            .timeout(const Duration(seconds: 30));
+        final coverBytes = cover['cover'] as Uint8List?;
+        if (coverBytes != null && mounted) {
+          final cf = File('${covers.path}/$id.cover');
+          await cf.writeAsBytes(coverBytes);
+          final i = _books.indexWhere((b) => b.id == id);
+          if (i >= 0) {
+            setState(() {
+              _books[i] = _books[i].copyWith(coverPath: cf.path);
+            });
+            await _persist();
+          }
+        }
+      } catch (_) {}
       // Book stays in the library with its file name as title.
       // Opening it retries the parse and shows the real reason
       // if it fails again — the book is never silently lost.
@@ -565,13 +587,20 @@ class _LibraryScreenState extends State<LibraryScreen> {
           await compute(parseBookIsolate, {'name': name, 'bytes': bytes})
               .timeout(const Duration(seconds: 120)),
         );
+        String? coverPath = book.coverPath;
+        if (parsed.coverBytes != null && coverPath == null) {
+          final covers = await _coversDir();
+          final cf = File('${covers.path}/${book.id}.cover');
+          await cf.writeAsBytes(parsed.coverBytes!);
+          coverPath = cf.path;
+        }
         final withChapters = LibraryBook(
           id: book.id,
           title: parsed.title,
           author: parsed.author,
           format: parsed.format,
           filePath: book.filePath,
-          coverPath: book.coverPath,
+          coverPath: coverPath,
           chapters: parsed.chapters,
           progress: book.progress,
           lastChapter: book.lastChapter,
@@ -582,12 +611,14 @@ class _LibraryScreenState extends State<LibraryScreen> {
           isFavourite: book.isFavourite,
           tags: book.tags,
           addedAt: book.addedAt,
+          lastReadAt: DateTime.now(),
         );
         setState(() {
           final i = _books.indexWhere((b) => b.id == book.id);
           if (i >= 0) _books[i] = withChapters;
         });
         book = withChapters;
+        _persist();
       } catch (e) {
         if (mounted) Navigator.pop(context);
         if (mounted) {
@@ -596,11 +627,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
             builder: (_) => AlertDialog(
               title: const Text('Could not open this book'),
               content: Text(
-                  'The file may have been moved or deleted, or it may be in a format InkBloom cannot read yet.\n\nReason: $e'),
+                  'The file may have been moved or deleted, or it may be in a format InkBloom cannot read yet. If it opens in another reader, it is almost certainly a format InkBloom parses badly — please tell us the file type and we will fix that format.\n\nReason: $e'),
               actions: [
                 TextButton(
                     onPressed: () => Navigator.pop(context),
                     child: const Text('OK')),
+                FilledButton(
+                    onPressed: () {
+                      Navigator.pop(context);
+                      _openBook(book);
+                    },
+                    child: const Text('Try again')),
               ],
             ),
           );
@@ -608,6 +645,17 @@ class _LibraryScreenState extends State<LibraryScreen> {
         return;
       }
       if (mounted) Navigator.pop(context);
+    }
+    // Opening a book counts as reading history, even if its
+    // chapters were already parsed on a previous open.
+    final opened = book.copyWith(lastReadAt: DateTime.now());
+    if (opened != book) {
+      setState(() {
+        final i = _books.indexWhere((b) => b.id == book.id);
+        if (i >= 0) _books[i] = opened;
+      });
+      _persist();
+      book = opened;
     }
     if (book.shelf == 'To Read') {
       final moved = book.copyWith(shelf: 'Reading');
@@ -775,14 +823,31 @@ class _LibraryScreenState extends State<LibraryScreen> {
         selectedItemColor: terracotta,
         unselectedItemColor: forest,
         onTap: (i) {
-          if (i == 1) {
-            _findBooksOnPhone();
+          if (i == 0) {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) => BooksScreen(
+                      books: _books,
+                      onOpen: _openBook,
+                      onFavourite: (b) => _updateBook(
+                          b.copyWith(isFavourite: !b.isFavourite)))),
+            );
+          } else if (i == 1) {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                  builder: (_) =>
+                      HistoryScreen(books: _books, onOpen: _openBook)),
+            );
           } else if (i == 2) {
+            _findBooksOnPhone();
+          } else if (i == 3) {
             Navigator.push(
               context,
               MaterialPageRoute(builder: (_) => const DictionaryScreen()),
             );
-          } else if (i == 3) {
+          } else if (i == 4) {
             Navigator.push(
               context,
               MaterialPageRoute(
@@ -791,13 +856,15 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       stats: _stats,
                       onSettingsChanged: _updateSettings)),
             );
-          } else if (i == 4) {
+          } else if (i == 5) {
             _openSettings();
           }
         },
         items: [
           BottomNavigationBarItem(
               icon: const Icon(Icons.menu_book), label: lang.t('books')),
+          BottomNavigationBarItem(
+              icon: const Icon(Icons.history), label: 'History'),
           BottomNavigationBarItem(
               icon: const Icon(Icons.search), label: lang.t('find')),
           BottomNavigationBarItem(
