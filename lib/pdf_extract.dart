@@ -336,6 +336,103 @@ String extractPdfTextFallback(Uint8List bytes) {
   return out.toString().replaceAll(RegExp(r'[ \t]+'), ' ').trim();
 }
 
+
+/// Fast first-pages extraction for the "open in 2 seconds"
+/// promise.
+///
+/// The full pipeline scans the whole file (font maps, Object
+/// Streams, every content stream) before returning anything.
+/// This one walks streams in file order, collects whatever
+/// CMaps/Differences it meets into one union map, decodes
+/// content streams with that union, and stops as soon as
+/// [maxChars] of text is banked. It never inflates images or
+/// font programs (binary bodies are rejected by a printable
+/// check), never builds per-font tables, and never re-decodes.
+/// The result is a preview: the reader opens on it at once,
+/// and the full per-font parse replaces it seconds later.
+/// Multi-font books may preview with the older union decoding
+/// until that swap lands — the full parse is the correct one.
+String extractPdfTextPartial(Uint8List bytes, int maxChars) {
+  final cmap = <int, String>{};
+  final diff = <int, String>{};
+  final out = StringBuffer();
+  var pos = 0;
+  var scanned = 0;
+  while (out.length < maxChars && scanned < 3000) {
+    var streamAt = _indexOf(bytes, _streamMarker, pos);
+    while (streamAt >= 3 &&
+        bytes[streamAt - 3] == 101 &&
+        bytes[streamAt - 2] == 110 &&
+        bytes[streamAt - 1] == 100) {
+      streamAt = _indexOf(bytes, _streamMarker, streamAt + _streamMarker.length);
+      if (streamAt < 0) break;
+    }
+    if (streamAt < 0) break;
+    var dataStart = streamAt + _streamMarker.length;
+    if (dataStart < bytes.length && bytes[dataStart] == 13) dataStart++;
+    if (dataStart < bytes.length && bytes[dataStart] == 10) dataStart++;
+    final dictStart = dataStart > 1024 ? dataStart - 1024 : 0;
+    final dictText = _ownDict(latin1.decode(
+        bytes.sublist(dictStart, streamAt),
+        allowInvalid: true));
+    final lenMatches = RegExp(r'/Length\s+(\d+)').allMatches(dictText);
+    final lenMatch = lenMatches.isEmpty ? null : lenMatches.last;
+    int dataEnd;
+    if (lenMatch != null) {
+      final len = int.tryParse(lenMatch.group(1)!) ?? 0;
+      dataEnd = dataStart + len;
+      if (dataEnd > bytes.length) dataEnd = bytes.length;
+    } else {
+      final endAt = _indexOf(bytes, _endstreamMarker, dataStart);
+      dataEnd = endAt < 0 ? bytes.length : endAt;
+    }
+    pos = dataEnd;
+    scanned++;
+    final isImage = dictText.contains('/Image') &&
+        (dictText.contains('/Subtype') || dictText.contains('/XObject'));
+    if (isImage) continue;
+    final raw = bytes.sublist(dataStart, dataEnd);
+    String body;
+    if (dictText.contains('/FlateDecode')) {
+      try {
+        body = latin1.decode(ZLibDecoder().convert(raw), allowInvalid: true);
+      } catch (_) {
+        continue;
+      }
+    } else {
+      body = latin1.decode(raw, allowInvalid: true);
+    }
+    if (body.contains('beginbfchar') || body.contains('beginbfrange')) {
+      final m = _parseCMap(body);
+      for (final e in m.entries) {
+        cmap.putIfAbsent(e.key, () => e.value);
+      }
+      continue;
+    }
+    final diffMatch =
+        RegExp(r'/Differences\s*\[(.*?)\]', dotAll: true).firstMatch(body);
+    if (diffMatch != null) {
+      _parseDifferences(diffMatch.group(1)!, diff);
+      continue;
+    }
+    // Binary bodies (font programs) can contain "Tj" by chance;
+    // real content streams are printable text. Reject bodies
+    // with more than 5% control bytes in the sample.
+    var control = 0;
+    var sampled = 0;
+    for (var k = 0; k < body.length && k < 2000; k++) {
+      final c = body.codeUnitAt(k);
+      sampled++;
+      if (c < 32 && c != 10 && c != 13 && c != 9) control++;
+    }
+    if (sampled > 0 && control * 20 > sampled) continue;
+    if (!body.contains('Tj') && !body.contains('TJ')) continue;
+    out.write(_textFromContent(body, (_) => null, cmap, diff));
+    out.write('\n');
+  }
+  return out.toString().replaceAll(RegExp(r'[ \t]+'), ' ').trim();
+}
+
 /// The object number of the `N 0 obj` header just before a
 /// stream's dictionary, or null when it cannot be linked.
 int? _objNumBefore(String windowText) {

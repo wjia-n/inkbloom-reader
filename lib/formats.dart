@@ -188,12 +188,11 @@ class BookParser {
       throw const FormatException(
           'Could not read this PDF. Scanned/image PDFs have no text to extract.');
     }
-    final parsed = _parseTxt(title, text);
     return ParsedBook(
       title: title,
       author: meta.author ?? 'Unknown Author',
       format: 'pdf',
-      chapters: parsed.chapters,
+      chapters: splitPdfChapters(text, title),
       coverBytes: extractPdfCover(bytes),
     );
   }
@@ -495,6 +494,190 @@ class BookParser {
     var text = out.toString().replaceAll(RegExp(r'[ \t]+'), ' ');
     text = text.replaceAll(RegExp(r'\n{3,}'), '\n\n');
     return text.trim();
+  }
+
+
+  /// Split PDF extractor output into real chapters.
+  ///
+  /// The extractor emits one line per text show operation, so
+  /// blank-line paragraph splitting (used for TXT) sees a whole
+  /// PDF as a single paragraph — which is why PDFs used to show
+  /// "Chapter 1 of 1" and why the reader had to lay out one
+  /// million-character paragraph (slow to open). This splitter
+  /// works line by line: a line that looks like a chapter
+  /// heading starts a new chapter, and the lines inside a
+  /// chapter are grouped into readable paragraphs.
+  ///
+  /// Headings come in three shapes, all seen in real novels:
+  /// "Chapter 12", "Chapter 12: The Inn", "Chapter 12 The first
+  /// time…" (heading glued to the first sentence), and the
+  /// letter-spaced form the extractor produces when a PDF
+  /// spaces its glyphs: "C h a p t e r 1 …". Prologue and
+  /// Epilogue count as chapters too. A book with no headings
+  /// at all falls back to 45-paragraph sections, the same rule
+  /// TXT already uses, so the chapters menu is never empty.
+  /// The split is prefix-safe: splitting a prefix of the text
+  /// (the fast first-pages preview) gives chapters that are a
+  /// prefix of splitting the whole text, so swapping the preview
+  /// for the full parse never moves text the reader already
+  /// shows above the current position.
+  static List<EpubChapter> splitPdfChapters(String text, String bookTitle) {
+    final chapters = <EpubChapter>[];
+    var paras = <String>[];
+    String? curTitle;
+    var foundHeading = false;
+    final curPara = StringBuffer();
+    void flushPara() {
+      if (curPara.isNotEmpty) {
+        paras.add(curPara.toString());
+        curPara.clear();
+      }
+    }
+
+    void flushChapter() {
+      if (paras.isNotEmpty) {
+        chapters.add(EpubChapter(
+            title: curTitle ?? bookTitle, paragraphs: [...paras]));
+        paras = [];
+      }
+    }
+
+    for (final raw in text.split('\n')) {
+      final line = raw.trim();
+      if (line.isEmpty) {
+        flushPara();
+        continue;
+      }
+      final heading = _pdfHeading(line);
+      if (heading != null) {
+        flushPara();
+        flushChapter();
+        curTitle = heading.title;
+        foundHeading = true;
+        if (heading.rest.isNotEmpty) curPara.write(heading.rest);
+        continue;
+      }
+      if (curPara.isNotEmpty) curPara.write(' ');
+      curPara.write(line);
+      if (curPara.length > 900) flushPara();
+    }
+    flushPara();
+    flushChapter();
+    if (chapters.isEmpty) {
+      return [EpubChapter(title: bookTitle, paragraphs: const [])];
+    }
+    if (!foundHeading) {
+      // No headings: section the book so the chapters menu
+      // still lets the reader jump around, mirroring _parseTxt.
+      final all = chapters.expand((c) => c.paragraphs).toList();
+      if (all.length > 45) {
+        final sections = <EpubChapter>[];
+        for (var i = 0; i < all.length; i += 45) {
+          sections.add(EpubChapter(
+              title: 'Chapter ${sections.length + 1}',
+              paragraphs: all.sublist(
+                  i, i + 45 > all.length ? all.length : i + 45)));
+        }
+        return sections;
+      }
+      return [EpubChapter(title: bookTitle, paragraphs: all)];
+    }
+    return chapters;
+  }
+
+  static const _numberWords = {
+    'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight',
+    'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen',
+    'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen',
+    'twenty',
+  };
+
+  static bool _isRoman(String s) =>
+      s.isNotEmpty && RegExp(r'^[ivxlcdm]+$').hasMatch(s);
+
+  static String _normalizeNumber(String num) {
+    if (RegExp(r'^[0-9]+$').hasMatch(num)) return num;
+    if (_isRoman(num.toLowerCase())) return num.toUpperCase();
+    return num[0].toUpperCase() + num.substring(1).toLowerCase();
+  }
+
+  static String _collapseSpaces(String s) =>
+      s.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+  /// A chapter heading line, or null. Returns the heading title
+  /// and any text after the heading on the same line (a heading
+  /// glued to its first sentence).
+  static ({String title, String rest})? _pdfHeading(String line) {
+    final trimmed = line.trim();
+    if (trimmed.isEmpty) return null;
+    // Normal style: "Chapter 12", "Chapter 12: The Inn",
+    // "Chapter 12 The first time…" (long line: split it).
+    final normal = RegExp(
+            r'^(chapter|part|section|prologue|epilogue)\s+([0-9]+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\b',
+            caseSensitive: false)
+        .firstMatch(trimmed);
+    if (normal != null) {
+      final word = normal.group(1)!;
+      final titleWord =
+          word[0].toUpperCase() + word.substring(1).toLowerCase();
+      final num = _normalizeNumber(normal.group(2)!);
+      final rest = trimmed
+          .substring(normal.end)
+          .trim()
+          .replaceFirst(RegExp(r'^[:.\-\u2013\u2014]\s*'), '');
+      if (trimmed.length <= 80) {
+        // Short line: the whole line is the heading, subtitle
+        // and all ("Chapter 12: The Inn").
+        return (title: _collapseSpaces(trimmed), rest: '');
+      }
+      return (title: '$titleWord $num', rest: rest);
+    }
+    // Bare "Prologue" / "Epilogue" on its own line.
+    final flat = trimmed.replaceAll(RegExp(r'\s+'), '').toLowerCase();
+    if (flat == 'prologue' || flat == 'epilogue') {
+      return (title: flat[0].toUpperCase() + flat.substring(1), rest: '');
+    }
+    // Letter-spaced style: "C h a p t e r 1 …". Walk single
+    // letters until the chapter word is spelled out, then take
+    // the number (digits, or a spelled number word).
+    final tokens = trimmed.split(RegExp(r'\s+'));
+    var i = 0;
+    var buf = '';
+    while (i < tokens.length && tokens[i].length == 1) {
+      buf += tokens[i];
+      i++;
+      final low = buf.toLowerCase();
+      if (low == 'chapter' || low == 'part' || low == 'section') break;
+    }
+    final spelled = buf.toLowerCase();
+    if (spelled == 'chapter' || spelled == 'part' || spelled == 'section') {
+      String? num;
+      if (i < tokens.length && RegExp(r'^[0-9]+$').hasMatch(tokens[i])) {
+        num = tokens[i];
+        i++;
+      } else {
+        var j = i;
+        var buf2 = '';
+        while (j < tokens.length && tokens[j].length == 1) {
+          buf2 += tokens[j];
+          j++;
+        }
+        final w = buf2.toLowerCase();
+        if (_numberWords.contains(w) || _isRoman(w)) {
+          num = buf2;
+          i = j;
+        }
+      }
+      if (num != null) {
+        final titleWord =
+            spelled[0].toUpperCase() + spelled.substring(1);
+        return (
+          title: '$titleWord ${_normalizeNumber(num)}',
+          rest: tokens.sublist(i).join(' '),
+        );
+      }
+    }
+    return null;
   }
 
   static ParsedBook _parseMarkdown(String title, String text) {

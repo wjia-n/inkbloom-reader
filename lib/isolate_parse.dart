@@ -19,7 +19,19 @@ Map<String, dynamic> parseBookIsolate(Map<String, dynamic> args) {
   final bytes = args['bytes'] as Uint8List;
   final lower = name.toLowerCase();
   final ParsedBook parsed;
-  if (lower.endsWith('.pdf')) {
+  final partialChars = args['partialChars'] as int?;
+  if (lower.endsWith('.pdf') && partialChars != null) {
+    // Fast preview: first pages only, no cover. The caller runs
+    // the full parse in the background and swaps it in.
+    final title = BookParser.fileTitleExact(name);
+    final text = extractPdfTextPartial(bytes, partialChars);
+    parsed = ParsedBook(
+      title: title,
+      author: 'Unknown Author',
+      format: 'pdf',
+      chapters: BookParser.splitPdfChapters(text, title),
+    );
+  } else if (lower.endsWith('.pdf')) {
     parsed = BookParser.parsePdfBytes(bytes, name);
   } else {
     parsed = BookParser.parse(name, bytes);
@@ -32,6 +44,7 @@ Map<String, dynamic> parseBookIsolate(Map<String, dynamic> args) {
         .map((c) => {'title': c.title, 'paragraphs': c.paragraphs})
         .toList(),
     'cover': parsed.coverBytes,
+    'partial': partialChars != null,
   };
 }
 

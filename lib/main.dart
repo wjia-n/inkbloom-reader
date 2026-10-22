@@ -15,6 +15,7 @@ import 'isolate_parse.dart';
 import 'dictionary.dart';
 import 'extra_screens.dart';
 import 'formats.dart';
+import 'epub_parser.dart';
 import 'book_cache.dart';
 import 'books_screens.dart';
 import 'brightness.dart';
@@ -697,6 +698,9 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     // Lazy parse: a saved imported book has no chapters in memory
     // until it is opened. Parse here, with a real error if it fails,
     // instead of opening an empty reader or dropping the book.
+    // For PDFs this may be set to the background full parse, so
+    // the reader can open on the first pages at once.
+    ValueNotifier<ParsedBook?>? pendingFull;
     if (book.chapters.isEmpty && !book.isBuiltin && book.filePath != null) {
       if (!mounted) return;
       // Cancellable: the old dialog trapped the user for the
@@ -730,17 +734,71 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         final name =
             book.originalName ?? book.filePath!.split('/').last;
         final bytes = await File(book.filePath!).readAsBytes();
-        final parsed = parsedBookFromIsolate(
-          await compute(parseBookIsolate, {'name': name, 'bytes': bytes})
-              .timeout(const Duration(seconds: 300)),
-        );
-        if (openCancelled) return;
+        final ParsedBook parsed;
         String? coverPath = book.coverPath;
-        if (parsed.coverBytes != null && coverPath == null) {
-          final covers = await _coversDir();
-          final cf = File('${covers.path}/${book.id}.cover');
-          await cf.writeAsBytes(parsed.coverBytes!);
-          coverPath = cf.path;
+        var isPartial = false;
+        if (book.format == 'pdf') {
+          // Progressive open: the full parse starts NOW and
+          // lands in the reader while she reads; the reader
+          // opens at once on the first pages (about 2 seconds
+          // even for a huge PDF, instead of minutes behind the
+          // "Opening your book…" dialog).
+          final notifier = ValueNotifier<ParsedBook?>(null);
+          pendingFull = notifier;
+          final Future<ParsedBook?> fullFuture = () async {
+            try {
+              final full = parsedBookFromIsolate(await compute(
+                      parseBookIsolate, {'name': name, 'bytes': bytes})
+                  .timeout(const Duration(seconds: 300)));
+              notifier.value = full;
+              final dir = await _booksDir();
+              await BookCache.write(
+                  dir, book.id, full.chapters, File(book.filePath!));
+              return full;
+            } catch (_) {
+              return null;
+            }
+          }();
+          ParsedBook? preview;
+          try {
+            preview = parsedBookFromIsolate(await compute(
+                    parseBookIsolate,
+                    {'name': name, 'bytes': bytes, 'partialChars': 120000})
+                .timeout(const Duration(seconds: 60)));
+          } catch (_) {
+            preview = null;
+          }
+          if (openCancelled) return;
+          if (preview != null && preview.chapters.isNotEmpty) {
+            parsed = preview;
+            isPartial = true;
+          } else {
+            // Empty or failed preview: wait for the full parse.
+            final full = await fullFuture;
+            if (openCancelled) return;
+            if (full == null) {
+              throw const FormatException('Could not read this PDF.');
+            }
+            parsed = full;
+            if (parsed.coverBytes != null && coverPath == null) {
+              final covers = await _coversDir();
+              final cf = File('${covers.path}/${book.id}.cover');
+              await cf.writeAsBytes(parsed.coverBytes!);
+              coverPath = cf.path;
+            }
+          }
+        } else {
+          parsed = parsedBookFromIsolate(
+            await compute(parseBookIsolate, {'name': name, 'bytes': bytes})
+                .timeout(const Duration(seconds: 300)),
+          );
+          if (openCancelled) return;
+          if (parsed.coverBytes != null && coverPath == null) {
+            final covers = await _coversDir();
+            final cf = File('${covers.path}/${book.id}.cover');
+            await cf.writeAsBytes(parsed.coverBytes!);
+            coverPath = cf.path;
+          }
         }
         // For a PDF without a stored original name (imported
         // before originalName existed), the fresh parse title
@@ -780,11 +838,15 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         });
         book = withChapters;
         _persist();
-        // Cache this parse so the next open is instant.
-        final cacheDir = await _booksDir();
-        // ignore: unawaited_futures
-        BookCache.write(cacheDir, book.id, parsed.chapters,
-            File(book.filePath!));
+        // Cache this parse so the next open is instant. The
+        // partial preview is NOT cached: the background full
+        // parse writes the cache when it lands.
+        if (!isPartial) {
+          final cacheDir = await _booksDir();
+          // ignore: unawaited_futures
+          BookCache.write(cacheDir, book.id, parsed.chapters,
+              File(book.filePath!));
+        }
       } catch (e) {
         if (openCancelled) return;
         if (mounted) Navigator.pop(context);
@@ -865,6 +927,7 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
           book: book,
           settings: _settings,
           onSettingsChanged: _updateSettings,
+          pendingFull: pendingFull,
         ),
       ),
     );
@@ -2317,11 +2380,17 @@ class ReaderScreen extends StatefulWidget {
   final LibraryBook book;
   final ReaderSettings settings;
   final ValueChanged<ReaderSettings> onSettingsChanged;
+  // Background full parse for a progressive PDF open: null
+  // normally, set while the reader shows the first-pages
+  // preview. The reader swaps the full chapters in when it
+  // fires, and shows "Loading the rest…" until then.
+  final ValueNotifier<ParsedBook?>? pendingFull;
   const ReaderScreen({
     super.key,
     required this.book,
     required this.settings,
     required this.onSettingsChanged,
+    this.pendingFull,
   });
   @override
   State<ReaderScreen> createState() => _ReaderScreenState();
@@ -2347,6 +2416,12 @@ class _TapHint extends StatelessWidget {
 
 class _ReaderScreenState extends State<ReaderScreen> {
   late ReaderSettings _s;
+  // Mutable chapter list: starts as the book's chapters and
+  // is replaced when a progressive full parse lands.
+  late List<EpubChapter> _chapters;
+  ValueNotifier<ParsedBook?>? _pendingFull;
+  VoidCallback? _fullListener;
+  bool _fullArrived = false;
   late int _chapter;
   late List<int> _bookmarks;
   late List<Highlight> _highlights;
@@ -2375,13 +2450,28 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void initState() {
     super.initState();
     _s = widget.settings;
+    _chapters = widget.book.chapters;
+    _pendingFull = widget.pendingFull;
+    if (_pendingFull != null) {
+      _fullListener = () {
+        final full = _pendingFull!.value;
+        if (full != null && mounted) {
+          setState(() {
+            _chapters = full.chapters;
+            _chapter = _chapter.clamp(0, _chapters.length - 1);
+            _fullArrived = true;
+          });
+        }
+      };
+      _pendingFull!.addListener(_fullListener!);
+    }
     // Controls start HIDDEN: the page is clean on open, and
     // a single tap brings the bars, the -/+ pill and the
     // chapter bar up. Nothing sits on the text otherwise.
     _barsVisible = false;
     applyBrightness(_s.brightness);
     _chapter =
-        widget.book.lastChapter.clamp(0, widget.book.chapters.length - 1);
+        widget.book.lastChapter.clamp(0, _chapters.length - 1);
     _bookmarks = [...widget.book.bookmarks];
     _highlights = [...widget.book.highlights];
     _applySystemUi();
@@ -2436,7 +2526,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     // Pauses between paragraphs: joining with spaces made
     // even a slow speed feel like one breathless rush.
     final text =
-        widget.book.chapters[_chapter].paragraphs.join('\n\n');
+        _chapters[_chapter].paragraphs.join('\n\n');
     final result = await _tts.speak(text);
     if (mounted) setState(() => _isSpeaking = result == 1);
   }
@@ -2448,6 +2538,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   @override
   void dispose() {
+    if (_fullListener != null) {
+      _pendingFull?.removeListener(_fullListener!);
+    }
     _statsTimer?.cancel();
     _recordReadingTime();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
@@ -2513,7 +2606,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void _guarded(VoidCallback action) => action();
 
   void _go(int chapter) {
-    if (chapter < 0 || chapter >= widget.book.chapters.length) return;
+    if (chapter < 0 || chapter >= _chapters.length) return;
     setState(() {
       _chapter = chapter;
     });
@@ -2536,7 +2629,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   void _updateChapterFromScroll() {
     if (_s.readingMode != 0 || !_scroll.hasClients) return;
     var found = _chapter;
-    for (var i = 0; i < widget.book.chapters.length; i++) {
+    for (var i = 0; i < _chapters.length; i++) {
       final ctx = _chapterKeys[i]?.currentContext;
       if (ctx == null) continue;
       final box = ctx.findRenderObject() as RenderBox?;
@@ -2548,7 +2641,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   LibraryBook _bookToReturn() {
-    final total = widget.book.chapters.length;
+    final total = _chapters.length;
     double progress;
     if (_s.readingMode == 0 &&
         _scroll.hasClients &&
@@ -2561,6 +2654,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     return widget.book.copyWith(
       progress: progress,
       lastChapter: _chapter,
+      chapters: _chapters,
       bookmarks: _bookmarks,
       highlights: _highlights,
     );
@@ -2823,7 +2917,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   return ListTile(
                     title: Text(h.snippet),
                     subtitle: Text(
-                        '${widget.book.chapters[h.chapter].title} • paragraph ${h.paragraph + 1}'),
+                        '${_chapters[h.chapter].title} • paragraph ${h.paragraph + 1}'),
                     onTap: () {
                       final term = controller.text;
                       Navigator.pop(context);
@@ -2864,7 +2958,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                     itemBuilder: (_, i) {
                       final h = _highlights[i];
                       final text =
-                          widget.book.chapters[h.chapter].paragraphs[h.paragraph];
+                          _chapters[h.chapter].paragraphs[h.paragraph];
                       return ListTile(
                         leading: Container(
                             width: 20,
@@ -2873,8 +2967,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
                         title: Text(text,
                             maxLines: 2, overflow: TextOverflow.ellipsis),
                         subtitle: Text(h.note.isEmpty
-                            ? widget.book.chapters[h.chapter].title
-                            : '${widget.book.chapters[h.chapter].title} • ${h.note}'),
+                            ? _chapters[h.chapter].title
+                            : '${_chapters[h.chapter].title} • ${h.note}'),
                         trailing: IconButton(
                           icon: const Icon(Icons.delete_outline),
                           onPressed: () {
@@ -2910,17 +3004,25 @@ class _ReaderScreenState extends State<ReaderScreen> {
           ),
         Expanded(
           child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Text(
-              'Chapter ${_chapter + 1} of ${widget.book.chapters.length}',
-              style: TextStyle(color: theme.fg, fontSize: 12),
+            GestureDetector(
+              onTap: () => _guarded(
+                  () => _scaffoldKey.currentState?.openDrawer()),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.list, size: 14, color: theme.fg),
+                const SizedBox(width: 4),
+                Text(
+                  'Chapter ${_chapter + 1} of ${_chapters.length}',
+                  style: TextStyle(color: theme.fg, fontSize: 12),
+                ),
+              ]),
             ),
             if (_s.showChapterSlider)
               Slider(
                 value: _chapter.toDouble(),
                 min: 0,
-                max: (widget.book.chapters.length - 1).toDouble(),
-                divisions: widget.book.chapters.length - 1 > 0
-                    ? widget.book.chapters.length - 1
+                max: (_chapters.length - 1).toDouble(),
+                divisions: _chapters.length - 1 > 0
+                    ? _chapters.length - 1
                     : null,
                 activeColor: theme.accent,
                 onChanged: (v) => _guarded(() => _go(v.round())),
@@ -2931,7 +3033,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
           IconButton(
             icon: const Icon(Icons.chevron_right),
             color: theme.fg,
-            onPressed: _chapter < widget.book.chapters.length - 1
+            onPressed: _chapter < _chapters.length - 1
                 ? () => _guarded(() => _go(_chapter + 1))
                 : null,
           ),
@@ -2941,7 +3043,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   Widget _body() {
     final theme = _s.effectiveTheme;
-    final chapter = widget.book.chapters[_chapter];
+    final chapter = _chapters[_chapter];
     if (_s.readingMode == 1) {
       final pages = paginate(chapter.paragraphs, _s.fontSize);
       return PageView.builder(
@@ -2990,8 +3092,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
     // old single-chapter list.)
     if (_s.readingMode == 0) {
       final all = <Widget>[];
-      for (var ci = 0; ci < widget.book.chapters.length; ci++) {
-        final ch = widget.book.chapters[ci];
+      for (var ci = 0; ci < _chapters.length; ci++) {
+        final ch = _chapters[ci];
         all.add(Text(ch.title,
             key: _chapterKeys.putIfAbsent(ci, () => GlobalKey()),
             style: TextStyle(
@@ -3007,13 +3109,13 @@ class _ReaderScreenState extends State<ReaderScreen> {
           ));
         }
         all.add(const SizedBox(height: 24));
-        if (ci < widget.book.chapters.length - 1) {
+        if (ci < _chapters.length - 1) {
           all.add(Center(
             child: FilledButton.icon(
               onPressed: () => _go(ci + 1),
               icon: const Icon(Icons.arrow_forward),
               label: Text(
-                  'Next chapter: ${widget.book.chapters[ci + 1].title}'),
+                  'Next chapter: ${_chapters[ci + 1].title}'),
             ),
           ));
           all.add(const SizedBox(height: 24));
@@ -3065,7 +3167,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   Widget build(BuildContext context) {
     final theme = _s.effectiveTheme;
     final showBars = _barsVisible;
-    if (widget.book.chapters.isEmpty) {
+    if (_chapters.isEmpty) {
       // Never a blank/black page: a book with no content yet gets
       // a clear message and a way back, instead of an empty screen.
       return Scaffold(
@@ -3126,6 +3228,18 @@ class _ReaderScreenState extends State<ReaderScreen> {
           }),
           tooltip: 'Read aloud',
         ),
+        // Chapters button: the chapters menu used to hide
+        // inside the ⋮ menu behind a toggle, and readers
+        // could not find it at all. One tap, always here
+        // when the toggle is on; the ⋮ menu also always
+        // offers it, and so does the chapter bar below.
+        if (_s.showTocButton)
+          IconButton(
+            icon: const Icon(Icons.list),
+            onPressed: () =>
+                _guarded(() => _scaffoldKey.currentState?.openDrawer()),
+            tooltip: 'Chapters',
+          ),
         // ONE clear settings icon (tune), not a text-size icon:
         // this opens text, theme, voice, navigation — everything.
         IconButton(
@@ -3154,8 +3268,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
             }
           },
           itemBuilder: (_) => [
-            if (_s.showTocButton)
-              const PopupMenuItem(value: 'chapters', child: Text('Chapters')),
+            const PopupMenuItem(value: 'chapters', child: Text('Chapters')),
             const PopupMenuItem(
                 value: 'notes', child: Text('Highlights & notes')),
             PopupMenuItem(
@@ -3191,6 +3304,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 Text(widget.book.author,
                     style: const TextStyle(color: Colors.white70)),
                 const SizedBox(height: 6),
+                Text(
+                  _chapters.isEmpty
+                      ? 'No chapters yet'
+                      : '${_chapters.length} chapters • You are here: '
+                          'Chapter ${_chapter + 1} — ${_chapters[_chapter].title}',
+                  style: const TextStyle(
+                      color: Colors.white, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 6),
                 Container(
                   padding: const EdgeInsets.symmetric(
                       horizontal: 8, vertical: 2),
@@ -3205,15 +3327,28 @@ class _ReaderScreenState extends State<ReaderScreen> {
               ],
             ),
           ),
-          ...List.generate(widget.book.chapters.length, (i) {
-            final c = widget.book.chapters[i];
+          ...List.generate(_chapters.length, (i) {
+            final c = _chapters[i];
+            final totalParas =
+                _chapters.fold<int>(0, (s, ch) => s + ch.paragraphs.length);
+            var before = 0;
+            for (var k = 0; k < i; k++) {
+              before += _chapters[k].paragraphs.length;
+            }
+            final startPct = totalParas > 0
+                ? (before * 100 ~/ totalParas)
+                : 0;
+            final here = i == _chapter;
             return ListTile(
-              selected: i == _chapter,
+              selected: here,
               selectedTileColor: sage.withValues(alpha: 0.3),
               leading: _bookmarks.contains(i)
                   ? const Icon(Icons.bookmark, color: terracotta, size: 18)
                   : Text('${i + 1}'),
               title: Text(c.title),
+              subtitle: Text(here
+                  ? 'You are here • ${c.paragraphs.length} paragraphs • starts at $startPct%'
+                  : '${c.paragraphs.length} paragraphs • starts at $startPct%'),
               onTap: () {
                 Navigator.pop(context);
                 _guarded(() => _go(i));
@@ -3327,6 +3462,20 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(24)),
                   child: _chapterBar(),
+                ),
+              ),
+            // Progressive open: while the full parse is still
+            // running, say so — the reader already shows the
+            // first pages, and the rest appears on its own.
+            if (_pendingFull != null && !_fullArrived)
+              const Positioned(
+                top: 16,
+                left: 0,
+                right: 0,
+                child: IgnorePointer(
+                  child: Center(
+                    child: _LoadingRestChip(),
+                  ),
                 ),
               ),
             // First-run hint: the page starts clean, so tell
@@ -4195,6 +4344,33 @@ class StatsScreen extends StatelessWidget {
             trailing: Text('${mins.toStringAsFixed(0)} min'),
           );
         }),
+      ]),
+    );
+  }
+}
+
+/// Small dark chip shown at the top of the reader while a
+/// progressive PDF's full parse is still running.
+class _LoadingRestChip extends StatelessWidget {
+  const _LoadingRestChip();
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(24),
+      ),
+      child: const Row(mainAxisSize: MainAxisSize.min, children: [
+        SizedBox(
+          width: 14,
+          height: 14,
+          child: CircularProgressIndicator(
+              strokeWidth: 2, color: Colors.white),
+        ),
+        SizedBox(width: 8),
+        Text('Loading the rest of the book…',
+            style: TextStyle(color: Colors.white, fontSize: 13)),
       ]),
     );
   }
