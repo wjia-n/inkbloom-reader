@@ -1832,7 +1832,7 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
 
 // ── App settings + transfer ─────────────────────────────────────────────
 
-class AppSettingsScreen extends StatelessWidget {
+class AppSettingsScreen extends StatefulWidget {
   final ReaderSettings settings;
   final String statsJson;
   final List<LibraryBook> books;
@@ -1848,8 +1848,37 @@ class AppSettingsScreen extends StatelessWidget {
   });
 
   @override
+  State<AppSettingsScreen> createState() => _AppSettingsScreenState();
+}
+
+class _AppSettingsScreenState extends State<AppSettingsScreen> {
+  late ReaderSettings _s;
+
+  @override
+  void initState() {
+    super.initState();
+    _s = widget.settings;
+  }
+
+  @override
+  void didUpdateWidget(covariant AppSettingsScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.settings != oldWidget.settings) _s = widget.settings;
+  }
+
+  /// Update this screen immediately AND persist via the parent.
+  /// The old stateless screen only called the parent: the parent
+  /// rebuilt, but this pushed route kept its original settings
+  /// object, so sliders snapped back and toggles looked dead
+  /// even though the value had saved underneath.
+  void _change(ReaderSettings s) {
+    setState(() => _s = s);
+    widget.onSettingsChanged(s);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final lang = AppLang.fromCode(settings.languageCode);
+    final lang = AppLang.fromCode(_s.languageCode);
     return Scaffold(
       appBar: AppBar(title: Text(lang.t('settings'))),
       body: ListView(
@@ -1866,8 +1895,8 @@ class AppSettingsScreen extends StatelessWidget {
               context,
               MaterialPageRoute(
                   builder: (_) => ReaderPreferencesScreen(
-                      settings: settings,
-                      onSettingsChanged: onSettingsChanged)),
+                      settings: _s,
+                      onSettingsChanged: _change)),
             ),
             icon: const Icon(Icons.tune),
             label: const Text(
@@ -1877,7 +1906,7 @@ class AppSettingsScreen extends StatelessWidget {
           ListTile(
             leading: const Icon(Icons.language),
             title: Text(lang.t('language')),
-            subtitle: Text(AppLang.fromCode(settings.languageCode).nativeName),
+            subtitle: Text(AppLang.fromCode(_s.languageCode).nativeName),
             trailing: const Icon(Icons.chevron_right),
             onTap: () async {
               final chosen = await showDialog<String>(
@@ -1888,36 +1917,36 @@ class AppSettingsScreen extends StatelessWidget {
                       .map((l) => SimpleDialogOption(
                             onPressed: () => Navigator.pop(context, l.code),
                             child: Text(
-                                '${l.nativeName}${l.code == settings.languageCode ? ' ✓' : ''}'),
+                                '${l.nativeName}${l.code == _s.languageCode ? ' ✓' : ''}'),
                           ))
                       .toList(),
                 ),
               );
               if (chosen != null) {
-                onSettingsChanged(settings.copyWith(languageCode: chosen));
+                _change(_s.copyWith(languageCode: chosen));
               }
             },
           ),
           const SizedBox(height: 12),
-          _switchTile('Show top bar', settings.showTopBar,
-              (v) => onSettingsChanged(settings.copyWith(showTopBar: v))),
-          _switchTile('Show bottom chapter bar', settings.showBottomBar,
-              (v) => onSettingsChanged(settings.copyWith(showBottomBar: v))),
-          _switchTile('Show chapter slider', settings.showChapterSlider,
-              (v) => onSettingsChanged(settings.copyWith(showChapterSlider: v))),
-          _switchTile('Show prev / next buttons', settings.showPrevNext,
-              (v) => onSettingsChanged(settings.copyWith(showPrevNext: v))),
-          _switchTile('Show bookmark button', settings.showBookmarkButton,
-              (v) => onSettingsChanged(settings.copyWith(showBookmarkButton: v))),
-          _switchTile('Show search button', settings.showSearchButton,
-              (v) => onSettingsChanged(settings.copyWith(showSearchButton: v))),
-          _switchTile('Show chapter-list button', settings.showTocButton,
-              (v) => onSettingsChanged(settings.copyWith(showTocButton: v))),
-          _switchTile('Tap centre to hide / show bars', settings.autoHideBars,
-              (v) => onSettingsChanged(settings.copyWith(autoHideBars: v))),
+          _switchTile('Show top bar', _s.showTopBar,
+              (v) => _change(_s.copyWith(showTopBar: v))),
+          _switchTile('Show bottom chapter bar', _s.showBottomBar,
+              (v) => _change(_s.copyWith(showBottomBar: v))),
+          _switchTile('Show chapter slider', _s.showChapterSlider,
+              (v) => _change(_s.copyWith(showChapterSlider: v))),
+          _switchTile('Show prev / next buttons', _s.showPrevNext,
+              (v) => _change(_s.copyWith(showPrevNext: v))),
+          _switchTile('Show bookmark button', _s.showBookmarkButton,
+              (v) => _change(_s.copyWith(showBookmarkButton: v))),
+          _switchTile('Show search button', _s.showSearchButton,
+              (v) => _change(_s.copyWith(showSearchButton: v))),
+          _switchTile('Show chapter-list button', _s.showTocButton,
+              (v) => _change(_s.copyWith(showTocButton: v))),
+          _switchTile('Tap centre to hide / show bars', _s.autoHideBars,
+              (v) => _change(_s.copyWith(autoHideBars: v))),
           _switchTile('Edge tap zones (left = back, right = next)',
-              settings.tapZones,
-              (v) => onSettingsChanged(settings.copyWith(tapZones: v))),
+              _s.tapZones,
+              (v) => _change(_s.copyWith(tapZones: v))),
           const SizedBox(height: 8),
           const Text('Navigation position',
               style: TextStyle(fontWeight: FontWeight.bold)),
@@ -1928,23 +1957,23 @@ class AppSettingsScreen extends StatelessWidget {
           ].map((e) => RadioListTile<int>(
                 title: Text(e.$2),
                 value: e.$1,
-                groupValue: settings.navPosition,
-                onChanged: (v) => onSettingsChanged(
-                    settings.copyWith(navPosition: v ?? 0)),
+                groupValue: _s.navPosition,
+                onChanged: (v) => _change(
+                    _s.copyWith(navPosition: v ?? 0)),
               )),
           const Divider(height: 32),
           const Text('Move everything to a new phone — fully offline',
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
           const SizedBox(height: 4),
           const Text(
-              'One backup file holds every imported book, cover, progress, bookmark, highlight and note, plus your settings. No account, no internet.'),
+              'One backup file holds every imported book, cover, progress, bookmark, highlight and note, plus your _s. No account, no internet.'),
           const SizedBox(height: 12),
           FilledButton.icon(
             onPressed: () async {
               final zip = TransferBundle.buildZip(
-                books: books,
-                settingsJson: jsonEncode(settings.toJson()),
-                statsJson: statsJson,
+                books: widget.books,
+                settingsJson: jsonEncode(_s.toJson()),
+                statsJson: widget.statsJson,
               );
               final uri = await FilePicker.saveFile(
                 fileName: 'inkbloom-backup.inkbloom',
@@ -2045,7 +2074,7 @@ class AppSettingsScreen extends StatelessWidget {
                   final prefs = await SharedPreferences.getInstance();
                   await prefs.setString('inkbloom_stats', bundle.statsJson);
                 }
-                onRestore(restored, restoredSettings);
+                widget.onRestore(restored, restoredSettings);
                 if (context.mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                       content: Text(
@@ -2070,21 +2099,21 @@ class AppSettingsScreen extends StatelessWidget {
             title: const Text('Colour & night'),
             children: [
               _switchTile('Auto night theme by time of day',
-                  settings.autoNight,
-                  (v) => onSettingsChanged(settings.copyWith(autoNight: v))),
+                  _s.autoNight,
+                  (v) => _change(_s.copyWith(autoNight: v))),
               ListTile(
                 title: Text(
-                    'Night from ${settings.nightStartHour}:00 to ${settings.nightEndHour}:00'),
+                    'Night from ${_s.nightStartHour}:00 to ${_s.nightEndHour}:00'),
                 subtitle: const Text('Use the sliders below to change the hours.'),
               ),
               _sliderTile('Night starts (hour)',
-                  settings.nightStartHour.toDouble(), 0, 23,
-                  (v) => onSettingsChanged(
-                      settings.copyWith(nightStartHour: v.round()))),
+                  _s.nightStartHour.toDouble(), 0, 23,
+                  (v) => _change(
+                      _s.copyWith(nightStartHour: v.round()))),
               _sliderTile('Night ends (hour)',
-                  settings.nightEndHour.toDouble(), 0, 23,
-                  (v) => onSettingsChanged(
-                      settings.copyWith(nightEndHour: v.round()))),
+                  _s.nightEndHour.toDouble(), 0, 23,
+                  (v) => _change(
+                      _s.copyWith(nightEndHour: v.round()))),
               const Padding(
                 padding: EdgeInsets.all(8),
                 child: Text('Colour themes — tap one to use it',
@@ -2094,10 +2123,10 @@ class AppSettingsScreen extends StatelessWidget {
                 spacing: 8,
                 runSpacing: 8,
                 children: readerThemes.asMap().entries.map((e) {
-                  final sel = settings.themeIndex == e.key;
+                  final sel = _s.themeIndex == e.key;
                   return GestureDetector(
-                    onTap: () => onSettingsChanged(
-                        settings.copyWith(themeIndex: e.key)),
+                    onTap: () => _change(
+                        _s.copyWith(themeIndex: e.key)),
                     child: Container(
                       width: 64,
                       height: 48,
@@ -2126,22 +2155,22 @@ class AppSettingsScreen extends StatelessWidget {
             children: [
               ListTile(
                 title: Text(
-                    'Speech speed ${settings.ttsRate.toStringAsFixed(1)}× • pitch ${settings.ttsPitch.toStringAsFixed(1)}'),
-                subtitle: Text(settings.ttsVoiceName.isEmpty
+                    'Speech speed ${_s.ttsRate.toStringAsFixed(1)}× • pitch ${_s.ttsPitch.toStringAsFixed(1)}'),
+                subtitle: Text(_s.ttsVoiceName.isEmpty
                     ? 'Voice: device default'
-                    : 'Voice: ${settings.ttsVoiceName}'),
+                    : 'Voice: ${_s.ttsVoiceName}'),
               ),
-              _sliderTile('Speech speed', settings.ttsRate, 0.3, 1.5,
-                  (v) => onSettingsChanged(settings.copyWith(ttsRate: v))),
-              _sliderTile('Speech pitch', settings.ttsPitch, 0.5, 2.0,
-                  (v) => onSettingsChanged(settings.copyWith(ttsPitch: v))),
+              _sliderTile('Speech speed', _s.ttsRate, 0.3, 1.5,
+                  (v) => _change(_s.copyWith(ttsRate: v))),
+              _sliderTile('Speech pitch', _s.ttsPitch, 0.5, 2.0,
+                  (v) => _change(_s.copyWith(ttsPitch: v))),
               TextButton.icon(
                 onPressed: () => Navigator.push(
                   context,
                   MaterialPageRoute(
                       builder: (_) => ReaderPreferencesScreen(
-                          settings: settings,
-                          onSettingsChanged: onSettingsChanged)),
+                          settings: _s,
+                          onSettingsChanged: _change)),
                 ),
                 icon: const Icon(Icons.record_voice_over),
                 label: const Text('Choose a voice & test it'),
@@ -2152,17 +2181,17 @@ class AppSettingsScreen extends StatelessWidget {
             title: const Text('Stats & goals'),
             children: [
               _sliderTile('Daily goal (minutes)',
-                  settings.goalMinutes.toDouble(), 5, 120,
-                  (v) => onSettingsChanged(
-                      settings.copyWith(goalMinutes: v.round()))),
+                  _s.goalMinutes.toDouble(), 5, 120,
+                  (v) => _change(
+                      _s.copyWith(goalMinutes: v.round()))),
               TextButton.icon(
                 onPressed: () => Navigator.push(
                   context,
                   MaterialPageRoute(
                       builder: (_) => StatsScreen(
-                          settings: settings,
-                          stats: ReadingStats.fromJsonString(statsJson),
-                          onSettingsChanged: onSettingsChanged)),
+                          settings: _s,
+                          stats: ReadingStats.fromJsonString(widget.statsJson),
+                          onSettingsChanged: _change)),
                 ),
                 icon: const Icon(Icons.bar_chart),
                 label: const Text('Open goals & stats screen'),
@@ -2178,24 +2207,24 @@ class AppSettingsScreen extends StatelessWidget {
               Wrap(
                 spacing: 8,
                 children: ['Serif', 'Sans', 'Mono'].asMap().entries.map((e) {
-                  final sel = settings.fontIndex == e.key;
+                  final sel = _s.fontIndex == e.key;
                   return ChoiceChip(
                     label: Text(e.value),
                     selected: sel,
-                    onSelected: (_) => onSettingsChanged(
-                        settings.copyWith(fontIndex: e.key)),
+                    onSelected: (_) => _change(
+                        _s.copyWith(fontIndex: e.key)),
                   );
                 }).toList(),
               ),
               Wrap(
                 spacing: 8,
-                children: settings.customFonts.asMap().entries.map((e) {
-                  final sel = settings.fontIndex == 3 + e.key;
+                children: _s.customFonts.asMap().entries.map((e) {
+                  final sel = _s.fontIndex == 3 + e.key;
                   return ChoiceChip(
                     label: Text(e.value),
                     selected: sel,
-                    onSelected: (_) => onSettingsChanged(
-                        settings.copyWith(fontIndex: 3 + e.key)),
+                    onSelected: (_) => _change(
+                        _s.copyWith(fontIndex: 3 + e.key)),
                   );
                 }).toList(),
               ),
@@ -2209,9 +2238,9 @@ class AppSettingsScreen extends StatelessWidget {
                   final family = await CustomFonts.importFont(
                       picked.name, await readPickedFile(picked));
                   if (family == null) return;
-                  final fonts = [...settings.customFonts];
+                  final fonts = [..._s.customFonts];
                   if (!fonts.contains(family)) fonts.add(family);
-                  onSettingsChanged(settings.copyWith(
+                  _change(_s.copyWith(
                       customFonts: fonts,
                       fontIndex: 3 + fonts.indexOf(family)));
                 },
@@ -2246,12 +2275,12 @@ class AppSettingsScreen extends StatelessWidget {
           ),
           const SizedBox(height: 16),
           TextButton(
-            onPressed: () => onSettingsChanged(const ReaderSettings()),
+            onPressed: () => _change(const ReaderSettings()),
             child: const Text('Reset all settings to defaults'),
           ),
           const SizedBox(height: 8),
           const Text(
-            'Package: com.wajiha.inkbloomreader • Fully offline • No account needed',
+            'Fully offline • No account needed',
             style: TextStyle(color: Colors.grey),
           ),
         ],

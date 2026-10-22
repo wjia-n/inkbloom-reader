@@ -1,4 +1,4 @@
-package com.wajiha.inkbloomreader
+package com.reader.wajiha.inkbloom.app.book.read
 
 import android.content.Intent
 import android.net.Uri
