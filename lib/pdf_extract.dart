@@ -9,25 +9,38 @@ import 'dart:typed_data';
 ///   Fast, but read every string as latin1 — so PDFs whose fonts
 ///   use a custom encoding (subset fonts, where a byte is a glyph
 ///   ID, not a letter) came out as garbage like "$IBQUFS".
-///   That is exactly what the user photographed in a big novel
-///   PDF: the app showed page after page of gibberish.
-/// - v2 (2026-10-21): the fix. PDFs carry the real mapping in
-///   their own font data, so the extractor now reads it:
-///   * /ToUnicode CMaps (beginbfchar / beginbfrange) inside
-///     inflated font streams — code -> real Unicode.
-///   * /Differences arrays in font dictionaries — code ->
-///     glyph name -> letter, for fonts without a CMap.
-///   Each content stream is decoded both ways (with the maps,
-///   and raw latin1 as before) and the more readable result
-///   wins, so a wrong map can never make text worse than v1.
-///   Also new: /Title + /Author from the PDF's own metadata
-///   (so a downloaded "book_17925970589_10922_0.pdf" shows
-///   its real title instead of its numeric filename), and the
-///   first embedded JPEG as a real cover thumbnail.
+/// - v2 (2026-10-21): read the font mappings: /ToUnicode CMaps
+///   and /Differences arrays, merged into ONE global map, and
+///   every content stream decoded twice (with maps, raw) with
+///   the more readable result winning.
+/// - v3 (2026-10-22): the two fixes the user demanded after
+///   v1.1.2 — speed, and text that is right in ANY language:
+///   * PER-FONT maps. v2's global union was the remaining
+///     correctness bug: a book's regular, bold and italic
+///     fonts are DIFFERENT subset fonts, each with its own
+///     glyph-ID mapping, so glyph 1 can mean 'a' in regular
+///     and 'b' in bold. Merging them decoded every bold or
+///     italic passage wrong. Now the extractor tracks the Tf
+///     operator (which font is active) and decodes each string
+///     with THAT font's own CMap / Differences / embedded
+///     TrueType cmap. The global union stays only as a
+///     fallback for streams whose font is unknown.
+///   * Font dictionaries hidden in Object Streams (PDF 1.5+,
+///     where most modern tools put them) are now decompressed
+///     and read, so /Differences there are no longer missed.
+///   * Embedded TrueType cmaps are read as a last-resort map
+///     for CID fonts with no ToUnicode table at all.
+///   * Speed: single-pass decode (the raw re-decode only runs
+///     when the mapped result is clearly garbage), content
+///     collection stops once 12 MB of decoded text is banked
+///     (output is capped at 10 MB anyway), and per-stream cap
+///     raised 1 MB -> 8 MB so big pages are no longer dropped.
 ///
 /// Limits that stay honest: scanned/image PDFs still have no
 /// text and are rejected by the caller; a PDF whose fonts carry
-/// NO mapping at all cannot be decoded by any pure extractor.
+/// NO mapping at all (no ToUnicode, no Differences, no
+/// embedded font cmap) cannot be decoded by any pure extractor,
+/// and non-Identity CIDToGIDMaps are not followed.
 
 /// One byte decoded as Windows-1252 (the encoding most
 /// Western PDFs and RTFs actually use). Unlike latin1, bytes
@@ -46,10 +59,63 @@ String win1252Char(int v) {
   return mapped == 0 ? '' : String.fromCharCode(mapped);
 }
 
+/// One font's decoding maps, resolved from its dictionary.
+/// [cmap] is its /ToUnicode table, [diff] its /Differences,
+/// [ttf] is glyph-ID -> character from its embedded TrueType
+/// cmap (inverted), used for CID fonts with no ToUnicode.
+class _PdfFont {
+  final Map<int, String> cmap;
+  final Map<int, String> diff;
+  final Map<int, String> ttf;
+  const _PdfFont({
+    this.cmap = const {},
+    this.diff = const {},
+    this.ttf = const {},
+  });
+  bool get hasMaps =>
+      cmap.isNotEmpty || diff.isNotEmpty || ttf.isNotEmpty;
+}
+
+/// A font dictionary found in the file: its object number
+/// (null when it could not be linked), its /ToUnicode stream
+/// reference, its /Differences body, and its /FontFile2
+/// (embedded TrueType) reference.
+class _FontDict {
+  final int? objNum;
+  final int? toUnicodeRef;
+  final String? diffBody;
+  final int? fontDescriptorRef;
+  // Resolved after scanning: direct /FontFile2, or via the
+  // font descriptor object the font points at (the normal
+  // real-world layout: font -> descriptor -> FontFile2).
+  int? fontFile2Ref;
+  _FontDict({
+    this.objNum,
+    this.toUnicodeRef,
+    this.diffBody,
+    this.fontDescriptorRef,
+    this.fontFile2Ref,
+  });
+}
+
 String extractPdfTextFallback(Uint8List bytes) {
-  final cmap = <int, String>{};
-  final diff = <int, String>{};
-  final contents = <String>[];
+  // ---- Pass 1: streams. Collect CMaps (by object number),
+  // embedded TrueType font programs (by object number),
+  // Object Stream bodies, and decoded content streams.
+  final cmapByObj = <int, Map<int, String>>{};
+  // CMaps whose stream carried no object number (rare):
+  // they join the global fallback map directly.
+  final unnumberedCmap = <int, String>{};
+  final ttfByObj = <int, Uint8List>{};
+  final objStmBodies = <String>[];
+  final objStmCounts = <int?>[];
+  // Every stream's location, by object number: font programs
+  // are found by REFERENCE from their font descriptor (their
+  // own dict is just a Length), so they are resolved in pass
+  // 2 from this metadata instead of by dict sniffing.
+  final streamMeta = <int, ({int start, int end, bool flate})>{};
+  final contents = <({int? objNum, String text})>[];
+  var contentsLen = 0;
   var pos = 0;
   var streamsSeen = 0;
   while (true) {
@@ -66,13 +132,13 @@ String extractPdfTextFallback(Uint8List bytes) {
     if (dataStart < bytes.length && bytes[dataStart] == 13) dataStart++;
     if (dataStart < bytes.length && bytes[dataStart] == 10) dataStart++;
     final dictStart = dataStart > 1024 ? dataStart - 1024 : 0;
-    final dictText = _ownDict(latin1.decode(
-        bytes.sublist(dictStart, streamAt),
-        allowInvalid: true));
+    final windowText =
+        latin1.decode(bytes.sublist(dictStart, streamAt), allowInvalid: true);
+    final dictText = _ownDict(windowText);
+    final objNum = _objNumBefore(windowText);
     final isImage = dictText.contains('/Image') &&
         (dictText.contains('/Subtype') || dictText.contains('/XObject'));
-    final isFont = dictText.contains('/FontFile') ||
-        dictText.contains('/FontDescriptor');
+    final isObjStm = dictText.contains('/ObjStm');
     final lenMatches = RegExp(r'/Length\s+(\d+)').allMatches(dictText);
     final lenMatch = lenMatches.isEmpty ? null : lenMatches.last;
     int dataEnd;
@@ -87,8 +153,12 @@ String extractPdfTextFallback(Uint8List bytes) {
     final streamLen = dataEnd - dataStart;
     pos = dataEnd;
     streamsSeen++;
-    if (isImage || isFont) continue;
-    if (streamLen <= 0 || streamLen > 1024 * 1024) continue;
+    if (objNum != null) {
+      streamMeta[objNum] =
+          (start: dataStart, end: dataEnd, flate: dictText.contains('/FlateDecode'));
+    }
+    if (isImage) continue;
+    if (streamLen <= 0 || streamLen > 8 * 1024 * 1024) continue;
     final streamBytes = bytes.sublist(dataStart, dataEnd);
     final isFlate = dictText.contains('/FlateDecode');
     String decoded;
@@ -105,52 +175,430 @@ String extractPdfTextFallback(Uint8List bytes) {
     } else {
       decoded = latin1.decode(streamBytes, allowInvalid: true);
     }
-    if (decoded.length > 1024 * 1024) continue;
+    if (isObjStm) {
+      objStmCounts.add(int.tryParse(
+          RegExp(r'/N\s+(\d+)').firstMatch(dictText)?.group(1) ?? ''));
+      objStmBodies.add(decoded);
+      continue;
+    }
+    if (decoded.length > 8 * 1024 * 1024) continue;
     if (decoded.contains('beginbfchar') ||
         decoded.contains('beginbfrange')) {
-      // A ToUnicode CMap: merge it, first mapping wins.
-      for (final e in _parseCMap(decoded).entries) {
-        cmap.putIfAbsent(e.key, () => e.value);
+      // A ToUnicode CMap: keep it under its object number so
+      // it can be tied to its font; unnumbered ones join the
+      // global fallback map directly.
+      final parsed = _parseCMap(decoded);
+      if (objNum != null) cmapByObj[objNum] = parsed;
+      // Also a global fallback (first mapping wins, as in
+      // v2): a CMap that cannot be tied to a font — minimal
+      // synthetic PDFs, or a font dict the scan missed —
+      // must still decode text instead of raw garbage. A
+      // font's OWN cmap always wins over this union when the
+      // font is known (see _decodeBytes lookup order).
+      for (final e in parsed.entries) {
+        unnumberedCmap.putIfAbsent(e.key, () => e.value);
       }
       continue;
     }
-    contents.add(decoded);
+    contents.add((objNum: objNum, text: decoded));
+    contentsLen += decoded.length;
+    // Output is capped at 10 MB anyway; banking more decoded
+    // text only burns time and memory on huge PDFs.
+    if (contentsLen > 12 * 1024 * 1024) break;
     if (streamsSeen > 20000) break;
   }
-  // /Differences live in font dictionaries (plain text, not
-  // streams). Scan the head of the file — font dictionaries
-  // for the body fonts sit early; bound the scan for big files.
-  final scanLen = bytes.length < 10 * 1024 * 1024
-      ? bytes.length
-      : 10 * 1024 * 1024;
+
+  // ---- Pass 2: font dictionaries + resource font mappings.
+  // Head text covers classic PDFs; Object Stream bodies cover
+  // modern (1.5+) PDFs whose dictionaries are compressed.
+  final scanLen =
+      bytes.length < 10 * 1024 * 1024 ? bytes.length : 10 * 1024 * 1024;
   final head = latin1.decode(bytes.sublist(0, scanLen), allowInvalid: true);
+  final fontDicts = <_FontDict>[];
+  final resourceFonts = <String, int>{};
+  final descriptors = <int, int>{};
+  _scanFontDicts(head, fontDicts, descriptors: descriptors);
+  _scanResourceFonts(head, resourceFonts);
+  final objStmObjects = <({int objNum, String text})>[];
+  for (final body in objStmBodies) {
+    final objs = _parseObjStm(body, n: objStmCounts.removeAt(0));
+    objStmObjects.addAll(objs);
+    for (final o in objs) {
+      _scanFontDicts(o.text, fontDicts,
+          fixedObjNum: o.objNum, descriptors: descriptors);
+      _scanResourceFonts(o.text, resourceFonts);
+    }
+  }
+  // Resolve indirect font programs: font -> descriptor -> File.
+  for (final fd in fontDicts) {
+    fd.fontFile2Ref ??= fd.fontDescriptorRef != null
+        ? descriptors[fd.fontDescriptorRef]
+        : null;
+  }
+
+  // /Differences in plain text (old fallback): keep scanning
+  // the head, merged into the global map.
+  final globalDiff = <int, String>{};
   for (final m in RegExp(r'/Differences\s*\[(.*?)\]', dotAll: true)
       .allMatches(head)) {
     final body = m.group(1)!;
     if (body.length > 10000) continue;
-    _parseDifferences(body, diff);
+    _parseDifferences(body, globalDiff);
+  }
+  final globalCmap = Map<int, String>.from(unnumberedCmap);
+
+  // Font programs, resolved by reference from pass-1 stream
+  // metadata (their own dicts carry no identifying marks).
+  final fontProgramObjs = <int>{};
+  for (final fd in fontDicts) {
+    final ref = fd.fontFile2Ref;
+    if (ref == null) continue;
+    fontProgramObjs.add(ref);
+    if (ttfByObj.containsKey(ref)) continue;
+    final meta = streamMeta[ref];
+    if (meta == null) continue;
+    final len = meta.end - meta.start;
+    if (len <= 0 || len >= 5 * 1024 * 1024) continue;
+    final raw = bytes.sublist(meta.start, meta.end);
+    if (meta.flate) {
+      try {
+        ttfByObj[ref] = Uint8List.fromList(ZLibDecoder().convert(raw));
+      } catch (_) {
+        continue;
+      }
+    } else {
+      ttfByObj[ref] = raw;
+    }
   }
 
-  final out = StringBuffer();
-  final useMaps = cmap.isNotEmpty || diff.isNotEmpty;
-  for (final content in contents) {
-    if (!useMaps) {
-      out.write(_textFromContent(content, const {}, const {}));
-    } else {
-      final withMaps = _textFromContent(content, cmap, diff);
-      final raw = _textFromContent(content, const {}, const {});
-      out.write(_readability(withMaps) >= _readability(raw)
-          ? withMaps
-          : raw);
+  // ---- Build fonts: resource name -> font, with its maps.
+  final fontsByResource = <String, _PdfFont>{};
+  for (final fd in fontDicts) {
+    final cmap = fd.toUnicodeRef != null
+        ? (cmapByObj[fd.toUnicodeRef] ?? <int, String>{})
+        : <int, String>{};
+    final diff = <int, String>{};
+    if (fd.diffBody != null) _parseDifferences(fd.diffBody!, diff);
+    var ttf = const <int, String>{};
+    if (fd.fontFile2Ref != null) {
+      final program = ttfByObj[fd.fontFile2Ref];
+      if (program != null) ttf = _parseTtfCmap(program) ?? ttf;
     }
+    final font = _PdfFont(cmap: cmap, diff: diff, ttf: ttf);
+    if (font.hasMaps) {
+      for (final e in font.cmap.entries) {
+        globalCmap.putIfAbsent(e.key, () => e.value);
+      }
+      for (final e in font.diff.entries) {
+        globalDiff.putIfAbsent(e.key, () => e.value);
+      }
+    }
+    // Link by object number through the resource mapping.
+    if (fd.objNum != null) {
+      for (final e in resourceFonts.entries) {
+        if (e.value == fd.objNum) fontsByResource[e.key] = font;
+      }
+    }
+  }
+
+  // ---- Pass 3: decode content streams, tracking Tf.
+  // Font program streams are not content, even though their
+  // dicts look exactly like content streams' dicts.
+  final out = StringBuffer();
+  for (final entry in contents) {
+    if (entry.objNum != null && fontProgramObjs.contains(entry.objNum)) {
+      continue;
+    }
+    final content = entry.text;
+    var decoded = _textFromContent(
+        content, (name) => fontsByResource[name], globalCmap, globalDiff);
+    // Safety net only: if the mapped result is clearly
+    // garbage, try raw and keep whichever reads better. This
+    // used to run on EVERY stream (2x work); now it runs
+    // only on streams that actually look broken.
+    if (_readability(decoded) < 0.2 &&
+        (globalCmap.isNotEmpty || globalDiff.isNotEmpty)) {
+      final raw = _textFromContent(
+          content, (_) => null, const {}, const {});
+      if (_readability(raw) > _readability(decoded)) decoded = raw;
+    }
+    out.write(decoded);
     out.write('\n');
     if (out.length > 10 * 1024 * 1024) break;
   }
   if (out.toString().trim().isEmpty) {
     out.write(_textFromContent(
-        latin1.decode(bytes, allowInvalid: true), const {}, const {}));
+        latin1.decode(bytes, allowInvalid: true),
+        (_) => null,
+        const {},
+        const {}));
   }
   return out.toString().replaceAll(RegExp(r'[ \t]+'), ' ').trim();
+}
+
+/// The object number of the `N 0 obj` header just before a
+/// stream's dictionary, or null when it cannot be linked.
+int? _objNumBefore(String windowText) {
+  final matches =
+      RegExp(r'(\d+)\s+0\s+obj').allMatches(windowText).toList();
+  if (matches.isEmpty) return null;
+  return int.tryParse(matches.last.group(1)!);
+}
+
+/// Find every top-level << ... >> block in [text] that looks
+/// like a font dictionary, and record its mappings. When
+/// [fixedObjNum] is given (Object Stream objects), it is the
+/// dictionary's object number; otherwise it is recovered from
+/// the `N 0 obj` header before the block, if there is one.
+void _scanFontDicts(String text, List<_FontDict> out,
+    {int? fixedObjNum, Map<int, int>? descriptors}) {
+  var i = 0;
+  final n = text.length;
+  while (i < n) {
+    final start = text.indexOf('<<', i);
+    if (start < 0) break;
+    var depth = 0;
+    var j = start;
+    var end = -1;
+    while (j + 1 < n) {
+      final two = text.substring(j, j + 2);
+      if (two == '<<') {
+        depth++;
+        j += 2;
+      } else if (two == '>>') {
+        depth--;
+        j += 2;
+        if (depth == 0) {
+          end = j;
+          break;
+        }
+      } else {
+        j++;
+      }
+    }
+    if (end < 0) break;
+    final block = text.substring(start, end);
+    if (block.contains('/BaseFont') ||
+        block.contains('/FontDescriptor') ||
+        (block.contains('/Type') && block.contains('/Font'))) {
+      final toUnicode = RegExp(r'/ToUnicode\s+(\d+)\s+0\s+R')
+          .firstMatch(block)
+          ?.group(1);
+      final diffMatch =
+          RegExp(r'/Differences\s*\[(.*?)\]', dotAll: true)
+              .firstMatch(block);
+      final fontFile2 = RegExp(r'/FontFile2\s+(\d+)\s+0\s+R')
+          .firstMatch(block)
+          ?.group(1);
+      final descriptorRef =
+          RegExp(r'/FontDescriptor\s+(\d+)\s+0\s+R')
+              .firstMatch(block)
+              ?.group(1);
+      int? objNum = fixedObjNum;
+      objNum ??= _objNumBefore(
+          text.substring(start > 200 ? start - 200 : 0, start));
+      final file2 =
+          fontFile2 != null ? int.tryParse(fontFile2) : null;
+      if (file2 != null && objNum != null) {
+        descriptors?[objNum] = file2;
+      }
+      out.add(_FontDict(
+        objNum: objNum,
+        toUnicodeRef:
+            toUnicode != null ? int.tryParse(toUnicode) : null,
+        diffBody: diffMatch?.group(1),
+        fontDescriptorRef: descriptorRef != null
+            ? int.tryParse(descriptorRef)
+            : null,
+        fontFile2Ref: file2,
+      ));
+    }
+    i = end;
+  }
+}
+
+/// Resource font mappings: /Font << /F1 12 0 R /F2 13 0 R >>.
+/// The Font dict itself is flat, so a simple regex is safe.
+void _scanResourceFonts(String text, Map<String, int> out) {
+  for (final m in
+      RegExp(r'/Font\s*<<(.*?)>>', dotAll: true).allMatches(text)) {
+    final body = m.group(1)!;
+    for (final pair
+        in RegExp(r'/([A-Za-z0-9]+)\s+(\d+)\s+0\s+R').allMatches(body)) {
+      final num = int.tryParse(pair.group(2)!);
+      if (num != null) out.putIfAbsent(pair.group(1)!, () => num);
+    }
+  }
+}
+
+/// Parse one inflated Object Stream body into its objects.
+/// The header is N pairs of (object number, byte offset);
+/// offsets count from the first object, whose offset is the
+/// header size (the first pair's offset).
+List<({int objNum, String text})> _parseObjStm(String body, {int? n}) {
+  final result = <({int objNum, String text})>[];
+  final tokens = body.split(RegExp(r'\s+'));
+  // The header is pairs of integers. When the dict's /N is
+  // known, take exactly 2*N tokens: an object that starts
+  // with a digit must not be swallowed into the header.
+  // Otherwise stop at the first non-integer token.
+  final nums = <int>[];
+  for (final tok in tokens) {
+    if (n != null && nums.length >= 2 * n) break;
+    final v = int.tryParse(tok);
+    if (v == null) break;
+    nums.add(v);
+  }
+  if (nums.length < 2 || nums.length.isOdd) return result;
+  final count = nums.length ~/ 2;
+  final objNums = <int>[];
+  final offsets = <int>[];
+  for (var k = 0; k < count; k++) {
+    objNums.add(nums[k * 2]);
+    offsets.add(nums[k * 2 + 1]);
+  }
+  // Re-find the object section: the header ends right where
+  // the first object starts, i.e. after the header tokens.
+  // Walk the body counting tokens to locate that boundary.
+  var pos = 0;
+  var seen = 0;
+  while (seen < nums.length && pos < body.length) {
+    while (pos < body.length &&
+        (body[pos] == ' ' ||
+            body[pos] == '\t' ||
+            body[pos] == '\n' ||
+            body[pos] == '\r')) {
+      pos++;
+    }
+    while (pos < body.length &&
+        body[pos] != ' ' &&
+        body[pos] != '\t' &&
+        body[pos] != '\n' &&
+        body[pos] != '\r') {
+      pos++;
+    }
+    seen++;
+  }
+  // The first object starts AFTER the whitespace following
+  // the header; offsets count from there, per spec.
+  while (pos < body.length &&
+      (body[pos] == ' ' ||
+          body[pos] == '\t' ||
+          body[pos] == '\n' ||
+          body[pos] == '\r')) {
+    pos++;
+  }
+  final sectionStart = pos;
+  for (var k = 0; k < count; k++) {
+    final start = sectionStart + offsets[k];
+    final end = k + 1 < count
+        ? sectionStart + offsets[k + 1]
+        : body.length;
+    if (start < 0 || start > body.length || end < start) continue;
+    result.add((objNum: objNums[k], text: body.substring(start, end)));
+  }
+  return result;
+}
+
+/// Invert an embedded TrueType cmap into glyph-ID -> character.
+/// Handles format 12 (preferred) and format 4. Returns null for
+/// non-TrueType programs (CFF / OTTO) and malformed tables.
+Map<int, String>? _parseTtfCmap(Uint8List bytes) {
+  if (bytes.length < 12) return null;
+  int u16(int o) => (bytes[o] << 8) | bytes[o + 1];
+  int u32(int o) =>
+      (bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3];
+  String charOf(int v) {
+    if (v <= 0xFFFF) return String.fromCharCode(v);
+    final high = 0xD800 + ((v - 0x10000) >> 10);
+    final low = 0xDC00 + ((v - 0x10000) & 0x3FF);
+    return String.fromCharCodes([high, low]);
+  }
+
+  final sfnt = u32(0);
+  if (sfnt != 0x00010000 && sfnt != 0x74727565) return null;
+  final numTables = u16(4);
+  int? cmapOff;
+  for (var k = 0; k < numTables; k++) {
+    final rec = 12 + k * 16;
+    if (rec + 16 > bytes.length) break;
+    final tag = String.fromCharCodes(bytes.sublist(rec, rec + 4));
+    if (tag == 'cmap') {
+      cmapOff = u32(rec + 8);
+      break;
+    }
+  }
+  if (cmapOff == null || cmapOff + 4 > bytes.length) return null;
+  final numSub = u16(cmapOff + 2);
+  int? fmt12;
+  int? fmt4;
+  for (var k = 0; k < numSub; k++) {
+    final rec = cmapOff + 4 + k * 8;
+    if (rec + 8 > bytes.length) break;
+    final off = u32(rec + 4);
+    final sub = cmapOff + off;
+    if (sub + 2 > bytes.length) continue;
+    final fmt = u16(sub);
+    if (fmt == 12 && fmt12 == null) fmt12 = sub;
+    if (fmt == 4 && fmt4 == null) fmt4 = sub;
+  }
+  final map = <int, String>{};
+  var budget = 200000;
+  if (fmt12 != null) {
+    if (fmt12 + 16 > bytes.length) return null;
+    final nGroups = u32(fmt12 + 12);
+    for (var g = 0; g < nGroups && budget > 0; g++) {
+      final rec = fmt12 + 16 + g * 12;
+      if (rec + 12 > bytes.length) break;
+      final startChar = u32(rec);
+      final endChar = u32(rec + 4);
+      final startGlyph = u32(rec + 8);
+      if (endChar < startChar) continue;
+      for (var ch = startChar; ch <= endChar && budget > 0; ch++) {
+        final glyph = startGlyph + (ch - startChar);
+        map.putIfAbsent(glyph, () => charOf(ch));
+        budget--;
+      }
+    }
+    return map.isEmpty ? null : map;
+  }
+  if (fmt4 != null) {
+    if (fmt4 + 14 > bytes.length) return null;
+    final segCount = u16(fmt4 + 6) ~/ 2;
+    final endBase = fmt4 + 14;
+    final startBase = endBase + 2 * segCount + 2;
+    final deltaBase = startBase + 2 * segCount;
+    final rangeBase = deltaBase + 2 * segCount;
+    int s16(int o) {
+      final v = u16(o);
+      return v >= 0x8000 ? v - 0x10000 : v;
+    }
+
+    for (var s = 0; s < segCount && budget > 0; s++) {
+      if (rangeBase + 2 * segCount > bytes.length) break;
+      final endCode = u16(endBase + 2 * s);
+      final startCode = u16(startBase + 2 * s);
+      final delta = s16(deltaBase + 2 * s);
+      final rangeOffset = u16(rangeBase + 2 * s);
+      if (endCode < startCode) continue;
+      for (var c = startCode; c <= endCode && budget > 0; c++) {
+        int glyph;
+        if (rangeOffset == 0) {
+          glyph = (c + delta) % 65536;
+        } else {
+          final addr = rangeBase + 2 * s + rangeOffset + 2 * (c - startCode);
+          if (addr + 2 > bytes.length) continue;
+          final gid = u16(addr);
+          if (gid == 0) continue;
+          glyph = (gid + delta) % 65536;
+        }
+        if (glyph != 0) map.putIfAbsent(glyph, () => charOf(c));
+        budget--;
+      }
+    }
+    return map.isEmpty ? null : map;
+  }
+  return null;
 }
 
 /// How much of [text] reads like real prose: spaces, lowercase
@@ -292,7 +740,8 @@ String? _glyphToChar(String name) {
     'underscore': '_', 'grave': '`', 'braceleft': '{', 'bar': '|',
     'braceright': '}', 'asciitilde': '~', 'bullet': '•',
     'endash': '–', 'emdash': '—', 'quoteleft': '‘',
-    'quoteright': '’', 'quotedblleft': '“', 'quotedblright': '”',
+    'quoteright': '’', 'quotedblleft': '“',
+    'quotedblright': '”',
     'ellipsis': '…', 'Euro': '€', 'sterling': '£', 'yen': '¥',
     'copyright': '©', 'registered': '®', 'trademark': '™',
     'degree': '°', 'acute': '´', 'dieresis': '¨',
@@ -328,10 +777,10 @@ String? _glyphToChar(String name) {
       String? value;
       if (i < text.length && text[i] == '(') {
         final atom = _readLiteral(text, i);
-        if (atom != null) value = _decodeBytes(atom.$1, const {}, const {});
+        if (atom != null) value = _decodeBytes(atom.$1, null, const {}, const {});
       } else if (i < text.length && text[i] == '<') {
         final atom = _readHex(text, i);
-        if (atom != null) value = _decodeBytes(atom.$1, const {}, const {});
+        if (atom != null) value = _decodeBytes(atom.$1, null, const {}, const {});
       }
       if (value != null) {
         value = value.replaceAll(RegExp(r'\s+'), ' ').trim();
@@ -447,11 +896,12 @@ int _indexOf(Uint8List hay, List<int> needle, int from) {
   return -1;
 }
 
-/// Decode raw string bytes into text: via the font maps when
-/// they have the code, otherwise the old raw behaviour (with
-/// UTF-16BE BOM support for metadata-style strings).
-String _decodeBytes(
-    List<int> bytes, Map<int, String> cmap, Map<int, String> diff) {
+/// Decode raw string bytes into text through the ACTIVE font's
+/// maps (its CMap, then Differences, then its embedded TrueType
+/// cmap), falling back to the global maps, then to raw WinAnsi.
+/// [font] is null for metadata strings and unknown fonts.
+String _decodeBytes(List<int> bytes, _PdfFont? font,
+    Map<int, String> globalCmap, Map<int, String> globalDiff) {
   if (bytes.length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
     final units = <int>[];
     for (var k = 2; k + 1 < bytes.length; k += 2) {
@@ -460,7 +910,14 @@ String _decodeBytes(
     while (units.isNotEmpty && units.last == 0) units.removeLast();
     return String.fromCharCodes(units);
   }
-  if (cmap.isEmpty && diff.isEmpty) {
+  final cmap = font?.cmap ?? const <int, String>{};
+  final diff = font?.diff ?? const <int, String>{};
+  final ttf = font?.ttf ?? const <int, String>{};
+  if (cmap.isEmpty &&
+      diff.isEmpty &&
+      ttf.isEmpty &&
+      globalCmap.isEmpty &&
+      globalDiff.isEmpty) {
     // No font map: the bytes are most likely WinAnsi
     // (Windows-1252). latin1 turned its smart quotes and
     // dashes into control characters; 1252 keeps them.
@@ -471,7 +928,7 @@ String _decodeBytes(
   while (i < bytes.length) {
     if (i + 1 < bytes.length) {
       final code2 = bytes[i] * 256 + bytes[i + 1];
-      final hit2 = cmap[code2];
+      final hit2 = cmap[code2] ?? ttf[code2] ?? globalCmap[code2];
       if (hit2 != null) {
         buf.write(hit2);
         i += 2;
@@ -479,7 +936,7 @@ String _decodeBytes(
       }
     }
     final code1 = bytes[i];
-    final hit1 = cmap[code1] ?? diff[code1];
+    final hit1 = cmap[code1] ?? diff[code1] ?? globalCmap[code1] ?? globalDiff[code1];
     if (hit1 != null) {
       buf.write(hit1);
       i++;
@@ -497,16 +954,33 @@ String _decodeBytes(
 /// Linear Tj/TJ scanner: walks the content once, collecting
 /// string atoms and emitting them only when a Tj (single),
 /// TJ (array), ' or " operator follows. No regex, no
-/// backtracking. Atoms are decoded through the font maps.
-String _textFromContent(
-    String content, Map<int, String> cmap, Map<int, String> diff) {
+/// backtracking. Atoms are decoded through the ACTIVE font's
+/// maps: the scanner tracks the Tf operator, so a string set
+/// in bold decodes with the bold font's mapping, not the
+/// regular font's. Unknown fonts fall back to the global maps.
+String _textFromContent(String content, _PdfFont? Function(String name) resolveFont,
+    Map<int, String> globalCmap, Map<int, String> globalDiff) {
   final buf = StringBuffer();
   var i = 0;
   final n = content.length;
+  _PdfFont? currentFont;
   bool isSpace(String c) =>
       c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
+  bool isNameChar(String c) =>
+      !isSpace(c) &&
+      c != '(' &&
+      c != ')' &&
+      c != '<' &&
+      c != '>' &&
+      c != '[' &&
+      c != ']' &&
+      c != '{' &&
+      c != '}' &&
+      c != '/' &&
+      c != '%';
+  bool isDigit(String c) => c.codeUnitAt(0) >= 48 && c.codeUnitAt(0) <= 57;
   void emit(List<int> atomBytes) {
-    buf.write(_decodeBytes(atomBytes, cmap, diff));
+    buf.write(_decodeBytes(atomBytes, currentFont, globalCmap, globalDiff));
     buf.write(' ');
   }
 
@@ -528,6 +1002,28 @@ String _textFromContent(
     final c = content[i];
     if (c == '%') {
       while (i < n && content[i] != '\n') i++;
+      continue;
+    }
+    if (c == '/') {
+      // A name: maybe a font selection (/F1 12 Tf). Read the
+      // name, skip an optional size number, and only act when
+      // Tf follows; other names (colors, XObjects) are just
+      // skipped, never treated as text.
+      var j = i + 1;
+      while (j < n && isNameChar(content[j])) j++;
+      final name = content.substring(i + 1, j);
+      var k = j;
+      while (k < n && isSpace(content[k])) k++;
+      while (k < n && (isDigit(content[k]) || content[k] == '.' || content[k] == '-')) {
+        k++;
+      }
+      while (k < n && isSpace(content[k])) k++;
+      if (k + 1 < n && content[k] == 'T' && content[k + 1] == 'f') {
+        currentFont = resolveFont(name);
+        i = k + 2;
+      } else {
+        i = j;
+      }
       continue;
     }
     if (c == '(') {
@@ -582,7 +1078,7 @@ String _textFromContent(
       while (i < n && isSpace(content[i])) i++;
       if (ok && i + 1 < n && content[i] == 'T' && content[i + 1] == 'J') {
         for (final a in atoms) {
-          buf.write(_decodeBytes(a, cmap, diff));
+          buf.write(_decodeBytes(a, currentFont, globalCmap, globalDiff));
         }
         buf.write(' ');
         i += 2;

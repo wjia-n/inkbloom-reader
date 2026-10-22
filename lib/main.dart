@@ -15,6 +15,7 @@ import 'isolate_parse.dart';
 import 'dictionary.dart';
 import 'extra_screens.dart';
 import 'formats.dart';
+import 'book_cache.dart';
 import 'books_screens.dart';
 import 'brightness.dart';
 import 'share_review.dart';
@@ -540,6 +541,12 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         );
       });
       await _persist();
+      // Cache the background parse too, so the first open
+      // after import is instant even for a big PDF.
+      if (old.filePath != null) {
+        await BookCache.write(await _booksDir(), id, parsed.chapters,
+            File(old.filePath!));
+      }
     } catch (_) {
       // Chapter parsing failed, but the book is NOT lost — and
       // it should still get its real cover. Try cover-only:
@@ -670,6 +677,23 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
   }
 
   Future<void> _openBook(LibraryBook book) async {
+    // Fast path: a previous parse is cached on disk (see
+    // BookCache). A big PDF then opens in milliseconds instead
+    // of re-running the whole extraction every time.
+    if (book.chapters.isEmpty && !book.isBuiltin && book.filePath != null) {
+      final cached = await BookCache.read(
+          await _booksDir(), book.id, File(book.filePath!));
+      if (cached != null && cached.isNotEmpty) {
+        final withCached =
+            book.copyWith(chapters: cached, lastReadAt: DateTime.now());
+        setState(() {
+          final i = _books.indexWhere((b) => b.id == book.id);
+          if (i >= 0) _books[i] = withCached;
+        });
+        book = withCached;
+        _persist();
+      }
+    }
     // Lazy parse: a saved imported book has no chapters in memory
     // until it is opened. Parse here, with a real error if it fails,
     // instead of opening an empty reader or dropping the book.
@@ -756,6 +780,11 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         });
         book = withChapters;
         _persist();
+        // Cache this parse so the next open is instant.
+        final cacheDir = await _booksDir();
+        // ignore: unawaited_futures
+        BookCache.write(cacheDir, book.id, parsed.chapters,
+            File(book.filePath!));
       } catch (e) {
         if (openCancelled) return;
         if (mounted) Navigator.pop(context);
@@ -1591,6 +1620,10 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     if (v == 'delete' && !book.isBuiltin) {
       setState(() => _books.removeWhere((b) => b.id == book.id));
       _persist();
+      // The cache is regenerable; leaving it would orphan
+      // megabytes per deleted book.
+      // ignore: unawaited_futures
+      _booksDir().then((dir) => BookCache.delete(dir, book.id));
       return;
     }
     if (v == 'fav') {
