@@ -44,6 +44,13 @@ class LibraryBook {
   final String format; // epub, txt, md, html
   final String? filePath;
   final String? coverPath; // extracted EPUB cover or user-set cover
+  /// The exact filename the user imported, e.g.
+  /// "book_17925970589_10922_0.pdf". Stored because the file
+  /// itself is copied under an internal id name, so without
+  /// this the original name is lost and the library can only
+  /// show a cleaned-up or metadata title — which the user
+  /// rightly reads as "the app renamed my book".
+  final String? originalName;
   final List<EpubChapter> chapters;
   final double progress; // 0..1
   final int lastChapter;
@@ -64,6 +71,7 @@ class LibraryBook {
     this.format = 'epub',
     this.filePath,
     this.coverPath,
+    this.originalName,
     this.progress = 0,
     this.lastChapter = 0,
     this.lastParagraph = 0,
@@ -83,12 +91,15 @@ class LibraryBook {
       chapters.fold(0, (s, c) => s + c.paragraphs.length);
 
   LibraryBook copyWith({
+    String? title,
+    String? author,
     double? progress,
     int? lastChapter,
     int? lastParagraph,
     List<int>? bookmarks,
     List<Highlight>? highlights,
     String? coverPath,
+    String? originalName,
     String? shelf,
     bool? isFavourite,
     List<String>? tags,
@@ -96,11 +107,12 @@ class LibraryBook {
   }) =>
       LibraryBook(
         id: id,
-        title: title,
-        author: author,
+        title: title ?? this.title,
+        author: author ?? this.author,
         format: format,
         filePath: filePath,
         coverPath: coverPath ?? this.coverPath,
+        originalName: originalName ?? this.originalName,
         chapters: chapters,
         progress: progress ?? this.progress,
         lastChapter: lastChapter ?? this.lastChapter,
@@ -121,6 +133,7 @@ class LibraryBook {
         'format': format,
         'filePath': filePath,
         'coverPath': coverPath,
+        'originalName': originalName,
         'progress': progress,
         'lastChapter': lastChapter,
         'lastParagraph': lastParagraph,
@@ -142,6 +155,7 @@ class LibraryBook {
         format: j['format'] as String? ?? 'epub',
         filePath: j['filePath'] as String?,
         coverPath: j['coverPath'] as String?,
+        originalName: j['originalName'] as String?,
         chapters: const [],
         progress: (j['progress'] as num?)?.toDouble() ?? 0,
         lastChapter: (j['lastChapter'] as num?)?.toInt() ?? 0,

@@ -28,6 +28,24 @@ import 'dart:typed_data';
 /// Limits that stay honest: scanned/image PDFs still have no
 /// text and are rejected by the caller; a PDF whose fonts carry
 /// NO mapping at all cannot be decoded by any pure extractor.
+
+/// One byte decoded as Windows-1252 (the encoding most
+/// Western PDFs and RTFs actually use). Unlike latin1, bytes
+/// 0x80-0x9F become real punctuation (smart quotes, dashes,
+/// euro) instead of invisible control characters — the old
+/// latin1 path turned those into missing/garbled glyphs.
+String win1252Char(int v) {
+  if (v < 0x80 || v >= 0xA0) return String.fromCharCode(v);
+  const table = [
+    0x20AC, 0x0000, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x0000, 0x017D, 0x0000,
+    0x0000, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x0000, 0x017E, 0x0178,
+  ];
+  final mapped = table[v - 0x80];
+  return mapped == 0 ? '' : String.fromCharCode(mapped);
+}
+
 String extractPdfTextFallback(Uint8List bytes) {
   final cmap = <int, String>{};
   final diff = <int, String>{};
@@ -330,10 +348,13 @@ String? _glyphToChar(String name) {
   return (title: find('Title'), author: find('Author'));
 }
 
-/// First embedded JPEG in the file — the closest thing a PDF
-/// has to a cover thumbnail. Returns null when the PDF has no
+/// The LARGEST embedded JPEG in the file — the closest thing
+/// a PDF has to a cover thumbnail. Largest, not first: the
+/// first JPEG in a book PDF is often a tiny logo, while the
+/// cover is the big picture. Returns null when the PDF has no
 /// JPEG image (then the library keeps its generated cover).
 Uint8List? extractPdfCover(Uint8List bytes) {
+  Uint8List? best;
   var pos = 0;
   while (true) {
     var streamAt = _indexOf(bytes, _streamMarker, pos);
@@ -345,7 +366,7 @@ Uint8List? extractPdfCover(Uint8List bytes) {
           _indexOf(bytes, _streamMarker, streamAt + _streamMarker.length);
       if (streamAt < 0) break;
     }
-    if (streamAt < 0) return null;
+    if (streamAt < 0) return best;
     var dataStart = streamAt + _streamMarker.length;
     if (dataStart < bytes.length && bytes[dataStart] == 13) dataStart++;
     if (dataStart < bytes.length && bytes[dataStart] == 10) dataStart++;
@@ -370,11 +391,14 @@ Uint8List? extractPdfCover(Uint8List bytes) {
     pos = dataEnd;
     if (!isImage || !isJpeg) continue;
     final len = dataEnd - dataStart;
-    if (len < 1024 || len > 3 * 1024 * 1024) continue;
+    if (len < 256 || len > 3 * 1024 * 1024) continue;
     if (bytes[dataStart] == 0xFF && bytes[dataStart + 1] == 0xD8) {
-      return Uint8List.fromList(bytes.sublist(dataStart, dataEnd));
+      if (best == null || len > best.length) {
+        best = Uint8List.fromList(bytes.sublist(dataStart, dataEnd));
+      }
     }
   }
+  // Unreachable: the loop only exits via the return above.
 }
 
 const _streamMarker = [115, 116, 114, 101, 97, 109]; // stream
@@ -437,7 +461,10 @@ String _decodeBytes(
     return String.fromCharCodes(units);
   }
   if (cmap.isEmpty && diff.isEmpty) {
-    return latin1.decode(bytes, allowInvalid: true);
+    // No font map: the bytes are most likely WinAnsi
+    // (Windows-1252). latin1 turned its smart quotes and
+    // dashes into control characters; 1252 keeps them.
+    return bytes.map(win1252Char).join();
   }
   final buf = StringBuffer();
   var i = 0;
@@ -459,7 +486,9 @@ String _decodeBytes(
       continue;
     }
     final b = code1;
-    if (b >= 32 || b == 9 || b == 10 || b == 13) buf.writeCharCode(b);
+    if (b >= 32 || b == 9 || b == 10 || b == 13) {
+      buf.write(b >= 0x80 ? win1252Char(b) : String.fromCharCode(b));
+    }
     i++;
   }
   return buf.toString();
@@ -608,7 +637,13 @@ String _textFromContent(
               j++;
             }
             bytes.add(int.tryParse(oct, radix: 8) ?? 32);
-            i = j - 1;
+            // j sits just past the last octal digit; the shared
+            // i += 2 below must land exactly on j, so the next
+            // character (often the closing ')') is not skipped.
+            // The old j - 1 skipped one char too many: a ')'
+            // right after an octal escape was eaten, the string
+            // never closed, and the whole page came out empty.
+            i = j - 2;
           } else {
             bytes.add(e.codeUnitAt(0));
           }

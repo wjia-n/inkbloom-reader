@@ -88,14 +88,42 @@ void main() {
     expect(text, contains('world'));
   });
 
-  test('PDF metadata title beats the numeric download filename', () {
+  test('PDF metadata is still read for the author', () {
     final meta = extractPdfMeta(garbledFontPdf());
     expect(meta.title, 'The Real Novel');
     expect(meta.author, 'Jane Writer');
+  });
+
+  test('PDF shows the EXACT imported name, never a renamed title', () {
     final book = BookParser.parsePdfBytes(
         garbledFontPdf(), 'book_17925970589_10922_0.pdf');
-    expect(book.title, 'The Real Novel');
+    // Underscores kept, metadata title NOT substituted:
+    // the user reads any change as "the app renamed my book".
+    expect(book.title, 'book_17925970589_10922_0');
     expect(book.author, 'Jane Writer');
+  });
+
+  test('PDF cover is the largest JPEG, not the first tiny one', () {
+    final small = List<int>.filled(300, 0);
+    small[0] = 0xFF;
+    small[1] = 0xD8;
+    final big = List<int>.filled(2000, 0);
+    big[0] = 0xFF;
+    big[1] = 0xD8;
+    final out = <int>[];
+    void add(String s) => out.addAll(utf8.encode(s));
+    add('%PDF-1.4\n');
+    add('1 0 obj << /Subtype /Image /XObject /Filter /DCTDecode '
+        '/Length ${small.length} >>\nstream\n');
+    out.addAll(small);
+    add('\nendstream\nendobj\n');
+    add('2 0 obj << /Subtype /Image /XObject /Filter /DCTDecode '
+        '/Length ${big.length} >>\nstream\n');
+    out.addAll(big);
+    add('\nendstream\nendobj\n');
+    final cover = extractPdfCover(Uint8List.fromList(out));
+    expect(cover, isNotNull);
+    expect(cover!.length, 2000);
   });
 
   test('Differences array decodes a custom-encoded font', () {

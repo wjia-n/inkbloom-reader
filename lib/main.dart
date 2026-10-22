@@ -195,6 +195,12 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
   String _shelfFilter = 'All';
   bool _grid = true;
   bool _loading = true;
+  /// True once _load() has read the saved library. _persist()
+  /// must NEVER write the library before this: on a slow
+  /// start the 5-second safety net shows sample books, and a
+  /// persist in that window used to overwrite the real saved
+  /// library with samples — books gone after reopening.
+  bool _libraryLoaded = false;
   final _searchFocus = FocusNode();
 
   @override
@@ -228,8 +234,15 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     // sample books and let the user in — saved books load on open.
     Future.delayed(const Duration(seconds: 5), () {
       if (mounted && _loading) {
+        // Merge samples IN, never replace: replacing _books
+        // here used to let a later persist overwrite the real
+        // library (still loading) with samples only.
         setState(() {
-          _books = sampleBooks();
+          final ids = _books.map((b) => b.id).toSet();
+          _books = [
+            ..._books,
+            ...sampleBooks().where((b) => !ids.contains(b.id)),
+          ];
           _loading = false;
         });
       }
@@ -257,6 +270,9 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
       } catch (_) {}
     }
     final builtIns = sampleBooks();
+    // Books imported while _load() was still running (or
+    // shown by the safety net) must survive it: merge any
+    // in-memory book the disk result does not already have.
     final result = <LibraryBook>[];
     for (final s in saved) {
       if (s.isBuiltin) {
@@ -286,17 +302,44 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     }
     final seen = result.map((b) => b.id).toSet();
     result.addAll(builtIns.where((b) => !seen.contains(b.id)));
+    final kept = _books
+        .where((b) => !result.any((r) => r.id == b.id))
+        .toList();
+    final merged = [...kept, ...result];
+    // Corrupt-save guard: saved JSON existed and mentioned
+    // real files, but nothing parsed out of it. Do not mark
+    // the library loaded — a later persist would overwrite
+    // the (possibly recoverable) save with samples only.
+    final corrupt = raw != null &&
+        raw.trim().isNotEmpty &&
+        saved.where((b) => !b.isBuiltin).isEmpty &&
+        RegExp(r'"filePath"\s*:\s*"').hasMatch(raw);
     if (!mounted) return;
     setState(() {
-      _books = result;
+      _books = merged;
       _loading = false;
+      // On a corrupt save, _libraryLoaded stays false, so
+      // library writes stay blocked (see the field comment).
+      _libraryLoaded = !corrupt;
     });
+    if (kept.isNotEmpty) await _persist();
+    if (corrupt && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text(
+              'Your saved books could not be read. Your book files are still on this phone — re-import them to restore the library.'),
+          duration: Duration(seconds: 8)));
+    }
   }
 
   Future<void> _persist() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-        'inkbloom_library_v2', jsonEncode(_books.map((b) => b.toJson()).toList()));
+    // Never write the library before it has been read (see
+    // _libraryLoaded): an early persist would wipe the saved
+    // books with whatever partial list is in memory.
+    if (_libraryLoaded) {
+      await prefs.setString(
+          'inkbloom_library_v2', jsonEncode(_books.map((b) => b.toJson()).toList()));
+    }
     await prefs.setString(
         'inkbloom_settings', jsonEncode(_settings.toJson()));
     // NOTE: stats are deliberately NOT written here. The
@@ -423,12 +466,18 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
       final id = 'book-${DateTime.now().microsecondsSinceEpoch}-$index';
       final file = File('${dir.path}/$id.$ext');
       await file.writeAsBytes(bytes);
+      // PDFs show the EXACT imported name (see parsePdfBytes);
+      // other formats keep the cleaned title as before.
+      final instantTitle = ext == 'pdf'
+          ? BookParser.fileTitleExact(name)
+          : _cleanTitle(name);
       final book = LibraryBook(
         id: id,
-        title: _cleanTitle(name),
+        title: instantTitle,
         author: 'Unknown Author',
         format: ext,
         filePath: file.path,
+        originalName: name,
         chapters: const [],
         addedAt: DateTime.now(),
       );
@@ -437,6 +486,12 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
       } else {
         _books.insert(0, book);
       }
+      // Save RIGHT NOW, not only at the end of the import
+      // loop: closing the app mid-import used to lose every
+      // book inserted so far, because nothing had persisted
+      // them yet. (Guarded: before _load finishes this skips
+      // the library write, and _load merges these books in.)
+      await _persist();
       // Parse in the background, without blocking the UI.
       // ignore: unawaited_futures
       _parseInBackground(id, name, bytes, covers);
@@ -470,6 +525,7 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
           author: parsed.author,
           format: parsed.format,
           filePath: old.filePath,
+          originalName: old.originalName ?? name,
           coverPath: coverPath ?? old.coverPath,
           chapters: parsed.chapters,
           progress: old.progress,
@@ -645,7 +701,10 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         ),
       ).then((_) => openCancelled = true);
       try {
-        final name = book.filePath!.split('/').last;
+        // Original imported name when we have it; the stored
+        // file itself lives under an internal id name.
+        final name =
+            book.originalName ?? book.filePath!.split('/').last;
         final bytes = await File(book.filePath!).readAsBytes();
         final parsed = parsedBookFromIsolate(
           await compute(parseBookIsolate, {'name': name, 'bytes': bytes})
@@ -659,12 +718,25 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
           await cf.writeAsBytes(parsed.coverBytes!);
           coverPath = cf.path;
         }
+        // For a PDF without a stored original name (imported
+        // before originalName existed), the fresh parse title
+        // would be the internal id name — keep the saved title
+        // instead. With an original name, parsed.title is its
+        // exact stem, which is what the user wants to see.
+        final lazyTitle =
+            (parsed.format == 'pdf' && book.originalName == null)
+                ? book.title
+                : parsed.title;
+        final lazyAuthor = book.author != 'Unknown Author'
+            ? book.author
+            : parsed.author;
         final withChapters = LibraryBook(
           id: book.id,
-          title: parsed.title,
-          author: parsed.author,
+          title: lazyTitle,
+          author: lazyAuthor,
           format: parsed.format,
           filePath: book.filePath,
+          originalName: book.originalName,
           coverPath: coverPath,
           chapters: parsed.chapters,
           progress: book.progress,
@@ -723,6 +795,30 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
       _persist();
       book = opened;
     }
+    // Books parsed before originalName existed (or before
+    // PDF covers) get fixed here, on open, without a
+    // re-import: exact PDF title + a cover refresh if the
+    // book has none. The cover fetch runs in the background
+    // and never blocks opening the book.
+    if (book.format == 'pdf') {
+      if (book.originalName != null) {
+        final exact = BookParser.fileTitleExact(book.originalName!);
+        if (exact != book.title) {
+          book = book.copyWith(title: exact);
+          setState(() {
+            final i = _books.indexWhere((b) => b.id == book.id);
+            if (i >= 0) _books[i] = book;
+          });
+          _persist();
+        }
+      }
+      final coverMissing = book.coverPath == null ||
+          !File(book.coverPath!).existsSync();
+      if (coverMissing && book.filePath != null) {
+        // ignore: unawaited_futures
+        _refreshPdfCover(book);
+      }
+    }
     if (book.shelf == 'To Read') {
       final moved = book.copyWith(shelf: 'Reading');
       setState(() {
@@ -762,6 +858,32 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     if (readSeconds >= 300 && mounted) {
       await _maybeShowClosePopup();
     }
+  }
+
+  /// Fetch a missing PDF cover in the background (books
+  /// imported before PDF covers existed never got one, and
+  /// opening them never refreshed it — so they showed the
+  /// generated letter cover forever).
+  Future<void> _refreshPdfCover(LibraryBook book) async {
+    try {
+      if (book.filePath == null) return;
+      final bytes = await File(book.filePath!).readAsBytes();
+      final name = book.originalName ?? book.filePath!.split('/').last;
+      final cover = await compute(
+              coverBookIsolate, {'name': name, 'bytes': bytes})
+          .timeout(const Duration(seconds: 120));
+      final coverBytes = cover['cover'] as Uint8List?;
+      if (coverBytes == null || !mounted) return;
+      final covers = await _coversDir();
+      final cf = File('${covers.path}/${book.id}.cover');
+      await cf.writeAsBytes(coverBytes);
+      final i = _books.indexWhere((b) => b.id == book.id);
+      if (i < 0) return;
+      setState(() {
+        _books[i] = _books[i].copyWith(coverPath: cf.path);
+      });
+      await _persist();
+    } catch (_) {}
   }
 
   Future<void> _maybeShowClosePopup() async {

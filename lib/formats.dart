@@ -54,7 +54,7 @@ class BookParser {
       return _parseOdt(_fileTitle(fileName), bytes);
     }
     if (lower.endsWith('.rtf')) {
-      final plain = _rtfToText(utf8.decode(bytes, allowMalformed: true));
+      final plain = _rtfToText(decodeTextBytes(bytes));
       return _parseTxt(_fileTitle(fileName), plain)
           .copyFormat('rtf');
     }
@@ -63,7 +63,7 @@ class BookParser {
       throw const FormatException(
           'PDF needs async parsing: use BookParser.parsePdfFile.');
     }
-    final text = utf8.decode(bytes, allowMalformed: true);
+    final text = decodeTextBytes(bytes);
     if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
       return _parseMarkdown(_fileTitle(fileName), text);
     }
@@ -81,6 +81,76 @@ class BookParser {
     }
     // Default: .txt
     return _parseTxt(_fileTitle(fileName), text);
+  }
+
+  /// Exact imported filename stem: no cleaning at all, so a
+  /// PDF shows precisely the name it had when downloaded.
+  static String fileTitleExact(String fileName) {
+    final base = fileName.split('/').last.split('\\').last;
+    final dot = base.lastIndexOf('.');
+    final stem = dot > 0 ? base.substring(0, dot) : base;
+    return stem.isEmpty ? 'Untitled Book' : stem;
+  }
+
+  static String _fileTitleExact(String fileName) =>
+      fileTitleExact(fileName);
+
+  /// Decode book text bytes the way real files are actually
+  /// saved: UTF-8 (with or without BOM), UTF-16 with a BOM or
+  /// by shape (every second byte zero), and Windows-1252 as
+  /// the last resort. The old code used utf8 with
+  /// allowMalformed, which turned every non-UTF-8 byte — smart
+  /// quotes, accented letters, whole non-English passages —
+  /// into replacement characters, i.e. unreadable words.
+  static String decodeTextBytes(Uint8List bytes) {
+    if (bytes.length >= 3 &&
+        bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
+      return utf8.decode(bytes.sublist(3), allowMalformed: true);
+    }
+    if (bytes.length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
+      return _decodeUtf16(bytes.sublist(2), littleEndian: true);
+    }
+    if (bytes.length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
+      return _decodeUtf16(bytes.sublist(2), littleEndian: false);
+    }
+    // UTF-16 without a BOM: ASCII text with a zero byte
+    // between every letter is the giveaway.
+    if (bytes.length >= 40 && bytes.length.isEven) {
+      var zerosEven = 0;
+      var zerosOdd = 0;
+      final sample = bytes.length < 400 ? bytes.length : 400;
+      for (var k = 0; k < sample; k++) {
+        if (bytes[k] == 0) {
+          if (k.isEven) {
+            zerosEven++;
+          } else {
+            zerosOdd++;
+          }
+        }
+      }
+      if (zerosEven > sample * 0.35) {
+        return _decodeUtf16(bytes, littleEndian: true);
+      }
+      if (zerosOdd > sample * 0.35) {
+        return _decodeUtf16(bytes, littleEndian: false);
+      }
+    }
+    try {
+      return utf8.decode(bytes);
+    } catch (_) {
+      return bytes.map(win1252Char).join();
+    }
+  }
+
+  static String _decodeUtf16(Uint8List bytes,
+      {required bool littleEndian}) {
+    final units = <int>[];
+    for (var k = 0; k + 1 < bytes.length; k += 2) {
+      units.add(littleEndian
+          ? bytes[k] + bytes[k + 1] * 256
+          : bytes[k] * 256 + bytes[k + 1]);
+    }
+    return String.fromCharCodes(units);
   }
 
   static String _fileTitle(String fileName) {
@@ -105,12 +175,14 @@ class BookParser {
   /// PDF from raw bytes (used by the isolate import path, which has
   /// no File access on the worker side).
   static ParsedBook parsePdfBytes(Uint8List bytes, String fileName) {
-    // The PDF's own metadata wins over the filename: a file
-    // downloaded as "book_17925970589_10922_0.pdf" shows its
-    // real title, not its numeric download name. The app never
-    // renames the file itself — this is only the display title.
+    // Display title = the EXACT name the user imported, stem
+    // only (no underscore cleaning, no metadata override).
+    // v1.1.1 used the PDF's metadata title here, and the user
+    // rightly read that as "the app renamed my book": she
+    // knows her downloads by their filenames. Metadata is
+    // still used for the author, which never renames anything.
     final meta = extractPdfMeta(bytes);
-    final title = meta.title ?? _fileTitle(fileName);
+    final title = _fileTitleExact(fileName);
     final text = extractPdfTextFallback(bytes);
     if (text.isEmpty) {
       throw const FormatException(
@@ -248,7 +320,7 @@ class BookParser {
 
   static ParsedBook _parseFb2(String title, Uint8List bytes) {
     try {
-      final doc = XmlDocument.parse(utf8.decode(bytes, allowMalformed: true));
+      final doc = XmlDocument.parse(decodeTextBytes(bytes));
       var bookTitle = title;
       var author = 'Unknown Author';
       final titleInfo = doc.findAllElements('title-info').firstOrNull;
@@ -290,19 +362,139 @@ class BookParser {
     }
   }
 
+  /// RTF -> plain text, done with a real scanner, not regexes.
+  /// Why it had to be rewritten (user bug, 2026-10-22): the old
+  /// version dropped every \\uN unicode escape as if it were a
+  /// formatting word, decoded \\'xx hex escapes as latin1
+  /// (so smart quotes and dashes became control characters),
+  /// let font-table names, info metadata and PICTURE BINARY
+  /// leak into the book as garbage words, and collapsed all
+  /// paragraph breaks into one giant paragraph. Non-English
+  /// RTF books came out as unreadable words — or lost letters.
+  /// This version: \\uN unicode (with \\ucN fallback skipping),
+  /// \\'xx as Windows-1252, font/colour/stylesheet/info/picture
+  /// groups skipped whole, paragraph breaks kept.
   static String _rtfToText(String rtf) {
-    var s = rtf;
-    s = s.replaceAll(RegExp(r'\par\b'), '\n\n');
-    s = s.replaceAllMapped(RegExp(r"'([0-9a-fA-F]{2})"), (m) {
-      // RTF hex escapes are written as \'xx; the backslash is handled
-      // by the control-word strip below, this handles the hex part.
-      final v = int.tryParse(m.group(1)!, radix: 16);
-      return v == null ? '' : String.fromCharCode(v);
-    });
-    // Drop control words and groups that are not text.
-    s = s.replaceAll(RegExp(r'\\[a-zA-Z]+-?\d* ?'), ' ');
-    s = s.replaceAll(RegExp(r'[{}]'), ' ');
-    return s.replaceAll(RegExp(r'\s+'), ' ').trim();
+    const skipGroups = {
+      'fonttbl', 'colortbl', 'stylesheet', 'info', 'pict', 'object',
+      'header', 'footer', 'footnote', 'generator', 'themedata',
+      'colorschememapping', 'latentstyles', 'datastore',
+    };
+    final out = StringBuffer();
+    var i = 0;
+    final n = rtf.length;
+    var ucSkip = 1;
+    var skipDepth = 0;
+    final groupSkipped = <bool>[];
+    bool isLetter(String c) =>
+        (c.codeUnitAt(0) >= 65 && c.codeUnitAt(0) <= 90) ||
+        (c.codeUnitAt(0) >= 97 && c.codeUnitAt(0) <= 122);
+    while (i < n) {
+      final c = rtf[i];
+      if (c == '{') {
+        var skipped = false;
+        if (i + 1 < n && rtf[i + 1] == '\\') {
+          if (i + 2 < n && rtf[i + 2] == '*') {
+            skipped = true; // destination group (\*\generator...)
+          } else {
+            final m =
+                RegExp(r'\\([a-zA-Z]+)').matchAsPrefix(rtf, i + 1);
+            if (m != null && skipGroups.contains(m.group(1))) {
+              skipped = true;
+            }
+          }
+        }
+        groupSkipped.add(skipped);
+        if (skipped) skipDepth++;
+        i++;
+        continue;
+      }
+      if (c == '}') {
+        if (groupSkipped.isNotEmpty && groupSkipped.removeLast()) {
+          skipDepth--;
+        }
+        i++;
+        continue;
+      }
+      if (skipDepth > 0) {
+        i++;
+        continue;
+      }
+      if (c == '\\') {
+        if (i + 1 >= n) break;
+        final nx = rtf[i + 1];
+        if (nx == "'") {
+          if (i + 3 < n) {
+            final v = int.tryParse(rtf.substring(i + 2, i + 4), radix: 16);
+            if (v != null) out.write(win1252Char(v));
+            i += 4;
+          } else {
+            i += 2;
+          }
+          continue;
+        }
+        if (!isLetter(nx)) {
+          if (nx == '~') {
+            out.write(' ');
+          } else if (nx == '_') {
+            out.write('-');
+          } else if (nx != '-' && nx != '\n' && nx != '\r') {
+            out.write(nx);
+          }
+          i += 2;
+          continue;
+        }
+        final m =
+            RegExp(r"\\([a-zA-Z]+)(-?\d*) ?").matchAsPrefix(rtf, i);
+        if (m == null) {
+          i++;
+          continue;
+        }
+        final word = m.group(1)!;
+        final arg = m.group(2);
+        i = m.end;
+        switch (word) {
+          case 'par':
+          case 'line':
+            out.write('\n\n');
+            break;
+          case 'tab':
+            out.write('\t');
+            break;
+          case 'uc':
+            ucSkip = int.tryParse(arg ?? '') ?? 1;
+            if (ucSkip < 0) ucSkip = 0;
+            break;
+          case 'u':
+            var v = int.tryParse(arg ?? '') ?? 0;
+            if (v < 0) v += 65536;
+            out.writeCharCode(v);
+            var left = ucSkip;
+            while (left > 0 && i < n) {
+              if (rtf[i] == '\\' && i + 1 < n && rtf[i + 1] == "'") {
+                i += 4;
+              } else {
+                i++;
+              }
+              left--;
+            }
+            break;
+          default:
+            break;
+        }
+        continue;
+      }
+      if (c == '\n' || c == '\r') {
+        out.write(' ');
+        i++;
+        continue;
+      }
+      out.write(c);
+      i++;
+    }
+    var text = out.toString().replaceAll(RegExp(r'[ \t]+'), ' ');
+    text = text.replaceAll(RegExp(r'\n{3,}'), '\n\n');
+    return text.trim();
   }
 
   static ParsedBook _parseMarkdown(String title, String text) {
