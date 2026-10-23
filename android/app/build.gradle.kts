@@ -29,11 +29,33 @@ android {
         versionName = flutter.versionName
     }
 
+    // Stable release signing: CI restores the keystore from the
+    // INKBLOOM_* secrets into INKBLOOM_STORE_FILE. Without it
+    // (local builds), release falls back to the debug keys.
+    // The stable key is what makes future updates install over
+    // the old app with all books and progress intact, so the
+    // user never has to back up or reinstall again.
+    val inkbloomStoreFile = System.getenv("INKBLOOM_STORE_FILE")
+        ?.let { file(it) }
+        ?.takeIf { it.exists() && it.length() > 0 }
+    signingConfigs {
+        if (inkbloomStoreFile != null) {
+            create("release") {
+                storeFile = inkbloomStoreFile
+                storePassword = System.getenv("INKBLOOM_STORE_PASSWORD")
+                keyAlias = System.getenv("INKBLOOM_KEY_ALIAS")
+                keyPassword = System.getenv("INKBLOOM_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (inkbloomStoreFile != null) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 }

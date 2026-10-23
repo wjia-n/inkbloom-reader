@@ -46,3 +46,7 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Signing keystores (never commit; InkBloom's lives in repo secrets)
+*.keystore
+*.jks

@@ -16,7 +16,13 @@ import 'epub_parser.dart';
 /// of serving stale chapters. A missing, stale or corrupt
 /// cache simply means one more parse — never an error.
 class BookCache {
-  static String _fileName(String bookId) => '$bookId.cache.json';
+  // v2: v1 caches were written before PDF chapters were split,
+  // so they hold a single million-character paragraph that
+  // freezes the reader on open. v1 files are ignored and
+  // cleaned up on the next write; the book is re-parsed
+  // with the splitter instead.
+  static String _fileName(String bookId) => '$bookId.cache2.json';
+  static String _oldFileName(String bookId) => '$bookId.cache.json';
 
   static Future<void> write(Directory dir, String bookId,
       List<EpubChapter> chapters, File source) async {
@@ -31,6 +37,10 @@ class BookCache {
       };
       final file = File('${dir.path}/${_fileName(bookId)}');
       await file.writeAsString(jsonEncode(data));
+    try {
+      final old = File('${dir.path}/${_oldFileName(bookId)}');
+      if (await old.exists()) await old.delete();
+    } catch (_) {}
     } catch (_) {
       // Cache is best-effort; a failed write must never
       // break opening or importing the book.
