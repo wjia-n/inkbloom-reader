@@ -928,6 +928,7 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
           settings: _settings,
           onSettingsChanged: _updateSettings,
           pendingFull: pendingFull,
+          onProgressChanged: (b) => _updateBook(b),
         ),
       ),
     );
@@ -1114,8 +1115,11 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
           books: _books,
           onSettingsChanged: _updateSettings,
           onRestore: (books, settings) {
+            // Merge, never replace: see mergeRestoredBooks.
+            // A restore must never delete books that are not
+            // in the backup.
             setState(() {
-              _books = books;
+              _books = mergeRestoredBooks(_books, books);
               _settings = settings;
             });
             _persist();
@@ -2385,12 +2389,19 @@ class ReaderScreen extends StatefulWidget {
   // preview. The reader swaps the full chapters in when it
   // fires, and shows "Loading the rest…" until then.
   final ValueNotifier<ParsedBook?>? pendingFull;
+  // Called while reading (every 30 seconds, on every chapter
+  // jump, and when the app goes to the background), so progress
+  // is saved continuously — not only when the reader is closed
+  // normally. If the app is swiped away or killed mid-read,
+  // the last saved position is at most 30 seconds old.
+  final ValueChanged<LibraryBook>? onProgressChanged;
   const ReaderScreen({
     super.key,
     required this.book,
     required this.settings,
     required this.onSettingsChanged,
     this.pendingFull,
+    this.onProgressChanged,
   });
   @override
   State<ReaderScreen> createState() => _ReaderScreenState();
@@ -2414,7 +2425,8 @@ class _TapHint extends StatelessWidget {
   }
 }
 
-class _ReaderScreenState extends State<ReaderScreen> {
+class _ReaderScreenState extends State<ReaderScreen>
+    with WidgetsBindingObserver {
   late ReaderSettings _s;
   // Mutable chapter list: starts as the book's chapters and
   // is replaced when a progressive full parse lands.
@@ -2437,7 +2449,17 @@ class _ReaderScreenState extends State<ReaderScreen> {
   final Map<int, GlobalKey> _chapterKeys = {};
   bool _showTapHint = true;
   final _scroll = ScrollController();
-  final _pageController = PageController();
+  // Late so the initial page can come from the saved paragraph
+  // (paged mode restores exactly, not at chapter start).
+  late PageController _pageController;
+  // Exact position within the current chapter, saved
+  // continuously and restored on open. Without this, reopening
+  // a book always landed at its chapter start even though a
+  // progress fraction was saved.
+  int _currentPara = 0;
+  DateTime _lastProgressSave = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _userScrolled = false;
+  bool _restoreSeekActive = false;
   final _scaffoldKey = GlobalKey<ScaffoldState>();
   final _tts = FlutterTts();
   bool _isSpeaking = false;
@@ -2449,6 +2471,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _s = widget.settings;
     _chapters = widget.book.chapters;
     _pendingFull = widget.pendingFull;
@@ -2472,6 +2495,27 @@ class _ReaderScreenState extends State<ReaderScreen> {
     applyBrightness(_s.brightness);
     _chapter =
         widget.book.lastChapter.clamp(0, _chapters.length - 1);
+    _currentPara = widget.book.lastParagraph;
+    var initialPage = 0;
+    if (_s.readingMode == 1 && _chapters.isNotEmpty) {
+      final pages = paginate(_chapters[_chapter].paragraphs, _s.fontSize);
+      var cum = 0;
+      for (var pi = 0; pi < pages.length; pi++) {
+        if (cum + pages[pi].length > _currentPara) {
+          initialPage = pi;
+          break;
+        }
+        cum += pages[pi].length;
+        initialPage = pi;
+      }
+    }
+    _pageController = PageController(initialPage: initialPage);
+    // Continuous / single-chapter modes restore after the
+    // first frame, once the list exists to scroll.
+    if (_s.readingMode != 1 && (_chapter > 0 || _currentPara > 0)) {
+      WidgetsBinding.instance
+          .addPostFrameCallback((_) => _restorePosition());
+    }
     _bookmarks = [...widget.book.bookmarks];
     _highlights = [...widget.book.highlights];
     _applySystemUi();
@@ -2510,6 +2554,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _stats = _stats.recordMinutes(minutes);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('inkbloom_stats', jsonEncode(_stats.toJson()));
+    // Same tick also saves the book's position, so a kill or
+    // swipe-away loses at most 30 seconds of reading.
+    widget.onProgressChanged?.call(_bookToReturn());
   }
 
   Future<void> _speakChapter() async {
@@ -2537,7 +2584,17 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   @override
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // App going to the background (switched away, locked,
+    // killed): save the position NOW, not on return.
+    if (state == AppLifecycleState.paused) {
+      widget.onProgressChanged?.call(_bookToReturn());
+    }
+  }
+
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     if (_fullListener != null) {
       _pendingFull?.removeListener(_fullListener!);
     }
@@ -2610,6 +2667,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() {
       _chapter = chapter;
     });
+    _currentPara = 0;
+    widget.onProgressChanged?.call(_bookToReturn());
     if (_s.readingMode == 0) {
       // Continuous scroll: jump to this chapter's heading.
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -2642,6 +2701,12 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   LibraryBook _bookToReturn() {
     final total = _chapters.length;
+    final safeChapter =
+        _chapters.isEmpty ? 0 : _chapter.clamp(0, _chapters.length - 1);
+    final maxPara = _chapters.isEmpty
+        ? 0
+        : _chapters[safeChapter].paragraphs.length - 1;
+    final safePara = maxPara <= 0 ? 0 : _currentPara.clamp(0, maxPara);
     double progress;
     if (_s.readingMode == 0 &&
         _scroll.hasClients &&
@@ -2649,15 +2714,113 @@ class _ReaderScreenState extends State<ReaderScreen> {
       progress = (_scroll.offset / _scroll.position.maxScrollExtent)
           .clamp(0.0, 1.0);
     } else {
-      progress = total <= 1 ? 1.0 : _chapter / (total - 1);
+      progress = total <= 1 ? 1.0 : safeChapter / (total - 1);
     }
     return widget.book.copyWith(
       progress: progress,
-      lastChapter: _chapter,
+      lastChapter: safeChapter,
+      lastParagraph: safePara,
       chapters: _chapters,
       bookmarks: _bookmarks,
       highlights: _highlights,
     );
+  }
+
+  /// Restore the saved paragraph after open (continuous and
+  /// single-chapter modes; paged mode restores via initialPage).
+  /// Paragraph keys only exist once their widgets are laid out,
+  /// so a far position is sought by moving the viewport toward
+  /// the target chapter until its keys appear, then snapping
+  /// exactly. Bounded, and abandoned the moment the reader
+  /// scrolls herself.
+  void _restorePosition() {
+    if (_chapters.isEmpty || _s.readingMode == 1 || !mounted) return;
+    final chapter = _chapter;
+    final maxPara = _chapters[chapter].paragraphs.length - 1;
+    final para = maxPara <= 0 ? 0 : _currentPara.clamp(0, maxPara);
+    if (chapter == 0 && para == 0) return;
+    _restoreSeekActive = true;
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) => _seekTo(chapter, para, 0));
+  }
+
+  void _seekTo(int chapter, int para, int attempt) {
+    if (!mounted || !_restoreSeekActive || _userScrolled || attempt > 60) {
+      _restoreSeekActive = false;
+      return;
+    }
+    final pCtx = _paraKeys['$chapter:$para']?.currentContext;
+    if (pCtx != null) {
+      _restoreSeekActive = false;
+      Scrollable.ensureVisible(pCtx,
+          duration: const Duration(milliseconds: 300));
+      return;
+    }
+    final cCtx = _chapterKeys[chapter]?.currentContext;
+    if (cCtx != null) {
+      _restoreSeekActive = false;
+      Scrollable.ensureVisible(cCtx,
+          duration: const Duration(milliseconds: 300));
+      return;
+    }
+    // Single-chapter lists have no chapter key to seek by;
+    // only the paragraph key can land there.
+    if (_s.readingMode != 0 || !_scroll.hasClients) {
+      _restoreSeekActive = false;
+      return;
+    }
+    final dir = chapter > _chapter ? 1 : -1;
+    final next = (_scroll.offset + dir * 4000)
+        .clamp(0.0, _scroll.position.maxScrollExtent);
+    if (next == _scroll.offset) {
+      _restoreSeekActive = false;
+      return;
+    }
+    _scroll.jumpTo(next);
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) => _seekTo(chapter, para, attempt + 1));
+  }
+
+  /// Paragraph nearest the top of the screen in the current
+  /// chapter, from the laid-out paragraph keys.
+  void _updateCurrentParaFromViewport() {
+    if (_chapters.isEmpty) return;
+    final ch = _chapters[_chapter.clamp(0, _chapters.length - 1)];
+    var best = -1;
+    for (var pi = 0; pi < ch.paragraphs.length; pi++) {
+      final ctx = _paraKeys['${_chapter}:$pi']?.currentContext;
+      if (ctx == null) continue;
+      final box = ctx.findRenderObject() as RenderBox?;
+      if (box == null || !box.hasSize) continue;
+      final dy = box.localToGlobal(Offset.zero).dy;
+      if (dy <= 140) {
+        best = pi;
+      } else {
+        break;
+      }
+    }
+    if (best >= 0) _currentPara = best;
+  }
+
+  /// Save while scrolling: throttled to every 5 seconds mid
+  /// scroll, immediately when scrolling settles, so a kill
+  /// mid-scroll loses seconds, never the session.
+  void _maybeSaveScrollPosition(ScrollNotification n) {
+    if (n is ScrollStartNotification && n.dragDetails != null) {
+      _userScrolled = true;
+    }
+    if (n is ScrollEndNotification) {
+      _updateCurrentParaFromViewport();
+      _lastProgressSave = DateTime.now();
+      widget.onProgressChanged?.call(_bookToReturn());
+      return;
+    }
+    final now = DateTime.now();
+    if (now.difference(_lastProgressSave).inSeconds >= 5) {
+      _updateCurrentParaFromViewport();
+      _lastProgressSave = now;
+      widget.onProgressChanged?.call(_bookToReturn());
+    }
   }
 
   Widget _paragraphWidget(int chapterIdx, int paraIdx, String text) {
@@ -3049,7 +3212,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
       return PageView.builder(
         controller: _pageController,
         itemCount: pages.length,
-        onPageChanged: (i) => setState(() {}),
+        onPageChanged: (i) {
+          var idx = 0;
+          for (var p = 0; p < i; p++) {
+            idx += pages[p].length;
+          }
+          _currentPara = idx;
+          setState(() {});
+          widget.onProgressChanged?.call(_bookToReturn());
+        },
         itemBuilder: (_, pi) => ListView(
           padding: EdgeInsets.all(_s.pageMargin),
           children: [
@@ -3127,8 +3298,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
         }
       }
       return NotificationListener<ScrollNotification>(
-        onNotification: (_) {
+        onNotification: (n) {
           _updateChapterFromScroll();
+          _maybeSaveScrollPosition(n);
           return false;
         },
         child: ListView(
@@ -3139,8 +3311,13 @@ class _ReaderScreenState extends State<ReaderScreen> {
       );
     }
     // Single-chapter list (horizontal scroll, mode 2).
-    return ListView(
-      controller: _scroll,
+    return NotificationListener<ScrollNotification>(
+      onNotification: (n) {
+        _maybeSaveScrollPosition(n);
+        return false;
+      },
+      child: ListView(
+        controller: _scroll,
       padding: EdgeInsets.all(_s.pageMargin),
       children: [
         Text(chapter.title,
@@ -3160,6 +3337,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
               style: TextStyle(color: theme.fg.withValues(alpha: 0.6))),
         ),
       ],
+      ),
     );
   }
 

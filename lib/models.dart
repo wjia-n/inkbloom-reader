@@ -284,3 +284,34 @@ List<LibraryBook> sampleBooks() {
 }
 
 String sampleBooksJson() => jsonEncode([]);
+
+/// Merge a restored backup library into the current one WITHOUT
+/// deleting anything.
+///
+/// Restoring used to REPLACE the whole library, so importing
+/// an old backup wiped every book added since that backup was
+/// made — books vanished with no warning. Now restored books
+/// are added, and for a book present in both, the copy read
+/// most recently wins (progress breaks ties). Nothing already
+/// in the library is ever removed by a restore.
+List<LibraryBook> mergeRestoredBooks(
+    List<LibraryBook> current, List<LibraryBook> restored) {
+  final merged = [...current];
+  for (final b in restored) {
+    final i = merged.indexWhere((m) => m.id == b.id);
+    if (i < 0) {
+      merged.add(b);
+    } else {
+      final existing = merged[i];
+      final bTime =
+          b.lastReadAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final eTime =
+          existing.lastReadAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+      if (bTime.isAfter(eTime) ||
+          (bTime == eTime && b.progress > existing.progress)) {
+        merged[i] = b;
+      }
+    }
+  }
+  return merged;
+}
