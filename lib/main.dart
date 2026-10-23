@@ -17,6 +17,7 @@ import 'extra_screens.dart';
 import 'formats.dart';
 import 'epub_parser.dart';
 import 'book_cache.dart';
+import 'library_backup.dart';
 import 'books_screens.dart';
 import 'brightness.dart';
 import 'share_review.dart';
@@ -202,6 +203,10 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
   /// start the 5-second safety net shows sample books, and a
   /// persist in that window used to overwrite the real saved
   /// library with samples — books gone after reopening.
+  /// A corrupt prefs value heals from the backup file
+  /// instead of blocking writes: blocking writes after a
+  /// corrupt load turned one torn write into every later
+  /// session vanishing on swipe-away.
   bool _libraryLoaded = false;
   final _searchFocus = FocusNode();
 
@@ -271,6 +276,29 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         }
       } catch (_) {}
     }
+    // Second chance: if prefs yielded no real books, the
+    // backup file may still have them (torn prefs write,
+    // wiped key). The backup is written atomically, so it
+    // is never torn itself.
+    var backupUsed = false;
+    if (saved.where((b) => !b.isBuiltin).isEmpty) {
+      final backupJson = await LibraryBackup.read(await _booksDir());
+      if (backupJson != null) {
+        final backupBooks = <LibraryBook>[];
+        try {
+          for (final e in jsonDecode(backupJson) as List) {
+            final b = LibraryBook.fromJson(e as Map<String, dynamic>);
+            if (b != null) backupBooks.add(b);
+          }
+        } catch (_) {}
+        if (backupBooks.where((b) => !b.isBuiltin).isNotEmpty) {
+          saved
+            ..clear()
+            ..addAll(backupBooks);
+          backupUsed = true;
+        }
+      }
+    }
     final builtIns = sampleBooks();
     // Books imported while _load() was still running (or
     // shown by the safety net) must survive it: merge any
@@ -308,23 +336,27 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         .where((b) => !result.any((r) => r.id == b.id))
         .toList();
     final merged = [...kept, ...result];
-    // Corrupt-save guard: saved JSON existed and mentioned
-    // real files, but nothing parsed out of it. Do not mark
-    // the library loaded — a later persist would overwrite
-    // the (possibly recoverable) save with samples only.
-    final corrupt = raw != null &&
-        raw.trim().isNotEmpty &&
-        saved.where((b) => !b.isBuiltin).isEmpty &&
+    // Books were expected (prefs mentioned real files) but
+    // neither prefs nor backup produced any: the library is
+    // genuinely gone from storage. Tell the user (their
+    // files are still on the phone to re-import), but DO
+    // NOT block future saves the way the old guard did:
+    // blocking writes after a corrupt load is what turned
+    // one torn write into every later session vanishing
+    // on swipe-away. The corrupt value is unreadable, so
+    // overwriting it with a good one loses nothing.
+    final corrupt = saved.where((b) => !b.isBuiltin).isEmpty &&
+        raw != null &&
         RegExp(r'"filePath"\s*:\s*"').hasMatch(raw);
     if (!mounted) return;
     setState(() {
       _books = merged;
       _loading = false;
-      // On a corrupt save, _libraryLoaded stays false, so
-      // library writes stay blocked (see the field comment).
-      _libraryLoaded = !corrupt;
+      _libraryLoaded = true;
     });
-    if (kept.isNotEmpty) await _persist();
+    // Heal prefs from the backup, and persist any books
+    // that arrived while loading was still running.
+    if (kept.isNotEmpty || backupUsed) await _persist();
     if (corrupt && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text(
@@ -339,8 +371,12 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     // _libraryLoaded): an early persist would wipe the saved
     // books with whatever partial list is in memory.
     if (_libraryLoaded) {
-      await prefs.setString(
-          'inkbloom_library_v2', jsonEncode(_books.map((b) => b.toJson()).toList()));
+      final json = jsonEncode(_books.map((b) => b.toJson()).toList());
+      await prefs.setString('inkbloom_library_v2', json);
+      // Second copy in its own atomically-renamed file, so
+      // a torn prefs write can never again lose the library:
+      // the next load heals prefs from this file.
+      await LibraryBackup.write(await _booksDir(), json);
     }
     await prefs.setString(
         'inkbloom_settings', jsonEncode(_settings.toJson()));
@@ -3467,42 +3503,64 @@ class _ReaderScreenState extends State<ReaderScreen>
       appBar: (_s.showTopBar && showBars) ? appBar : null,
       drawer: Drawer(
         child: ListView(children: [
-          DrawerHeader(
-            decoration: const BoxDecoration(color: forest),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                const Icon(Icons.menu_book_rounded,
-                    color: Colors.white, size: 32),
-                const SizedBox(height: 8),
-                Text(widget.book.title,
-                    style: const TextStyle(
-                        color: Colors.white, fontWeight: FontWeight.bold)),
-                Text(widget.book.author,
-                    style: const TextStyle(color: Colors.white70)),
-                const SizedBox(height: 6),
-                Text(
-                  _chapters.isEmpty
-                      ? 'No chapters yet'
-                      : '${_chapters.length} chapters • You are here: '
-                          'Chapter ${_chapter + 1} — ${_chapters[_chapter].title}',
-                  style: const TextStyle(
-                      color: Colors.white, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 6),
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 8, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: terracotta,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text('Format: ${widget.book.formatLabel}',
+          // Flexible header, NOT a fixed-height DrawerHeader:
+          // DrawerHeader is 160px tall and the "You are here"
+          // line had no line limit, so a long chapter title
+          // overflowed the header and its last line landed on
+          // top of the format pill below it. This header sizes
+          // to its content and every line is capped with an
+          // ellipsis, so the pill always sits below the text
+          // with a gap, for any book and any title length.
+          Container(
+            color: forest,
+            child: SafeArea(
+              bottom: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.menu_book_rounded,
+                        color: Colors.white, size: 32),
+                    const SizedBox(height: 8),
+                    Text(widget.book.title,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold)),
+                    Text(widget.book.author,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.white70)),
+                    const SizedBox(height: 6),
+                    Text(
+                      _chapters.isEmpty
+                          ? 'No chapters yet'
+                          : '${_chapters.length} chapters • You are here: '
+                              'Chapter ${_chapter + 1} — ${_chapters[_chapter].title}',
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
-                          color: Colors.white, fontSize: 12)),
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: terracotta,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text('Format: ${widget.book.formatLabel}',
+                          style: const TextStyle(
+                              color: Colors.white, fontSize: 12)),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
           ),
           ...List.generate(_chapters.length, (i) {
