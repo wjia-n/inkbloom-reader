@@ -13,12 +13,16 @@ class ParsedBook {
   final String format;
   final List<EpubChapter> chapters;
   final Uint8List? coverBytes;
+  /// EPUB illustrations, in marker order (see kEpubImageMarker
+  /// in epub_parser.dart). Other formats leave this empty.
+  final List<Uint8List> images;
   const ParsedBook({
     required this.title,
     required this.author,
     required this.format,
     required this.chapters,
     this.coverBytes,
+    this.images = const [],
   });
 }
 
@@ -42,6 +46,7 @@ class BookParser {
         format: 'epub',
         chapters: e.chapters,
         coverBytes: e.coverBytes,
+        images: e.images,
       );
     }
     if (lower.endsWith('.fb2')) {
@@ -752,6 +757,20 @@ class BookParser {
       chapters: chapters,
     );
   }
+}
+
+/// Page holding paragraph [para] in [pages] (from paginate).
+/// Out-of-range paragraphs clamp to the last page; empty
+/// input gives page 0. Used both for the initial page on
+/// open and for re-jumping when the full PDF text lands.
+int pageIndexForParagraph(List<List<String>> pages, int para) {
+  if (pages.isEmpty) return 0;
+  var cum = 0;
+  for (var pi = 0; pi < pages.length; pi++) {
+    if (cum + pages[pi].length > para) return pi;
+    cum += pages[pi].length;
+  }
+  return pages.length - 1;
 }
 
 /// Split a chapter's paragraphs into swipeable pages for Paged mode.

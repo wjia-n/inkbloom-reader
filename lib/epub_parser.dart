@@ -16,11 +16,14 @@ class ParsedEpub {
   final String author;
   final List<EpubChapter> chapters;
   final Uint8List? coverBytes;
+  /// Illustration bytes, in marker order.
+  final List<Uint8List> images;
   const ParsedEpub({
     required this.title,
     required this.author,
     required this.chapters,
     this.coverBytes,
+    this.images = const [],
   });
   int get totalParagraphs =>
       chapters.fold(0, (sum, c) => sum + c.paragraphs.length);
@@ -186,6 +189,7 @@ class EpubParser {
 
     // 4. Spine order -> chapters.
     final chapters = <EpubChapter>[];
+    final images = <Uint8List>[];
     final spine = opf.findAllElements('itemref');
     for (final ref in spine) {
       final idref = ref.getAttribute('idref');
@@ -202,15 +206,34 @@ class EpubParser {
       final html = utf8.decode(file.content, allowMalformed: true);
       final blocks = htmlToBlocks(html);
       if (blocks.isEmpty) continue;
-      final heading = blocks.firstWhere(
+      final chapterDir = entry.href.contains('/')
+          ? opfDir + entry.href.substring(0, entry.href.lastIndexOf('/') + 1)
+          : opfDir;
+      final textBlocks = blocks.where((b) => b.text.isNotEmpty).toList();
+      final heading = textBlocks.firstWhere(
         (b) => b.isHeading,
-        orElse: () => blocks.first,
+        orElse: () => textBlocks.isNotEmpty
+            ? textBlocks.first
+            : const EpubBlock('Images', false),
       );
+      final paras = <String>[];
+      for (final b in blocks) {
+        if (b.imageSrc != null) {
+          final img = findHref(b.imageSrc!, chapterDir);
+          if (img != null && img.content.isNotEmpty) {
+            images.add(Uint8List.fromList(img.content));
+            paras.add('$kEpubImageMarker${images.length - 1}');
+          }
+          continue;
+        }
+        if (b.text.isNotEmpty) paras.add(b.text);
+      }
+      if (paras.isEmpty) continue;
       chapters.add(EpubChapter(
         title: heading.text.length > 80
             ? '${heading.text.substring(0, 77)}…'
             : heading.text,
-        paragraphs: blocks.map((b) => b.text).where((t) => t.isNotEmpty).toList(),
+        paragraphs: paras,
       ));
     }
     if (chapters.isEmpty) {
@@ -221,6 +244,7 @@ class EpubParser {
       author: author,
       chapters: chapters,
       coverBytes: coverBytes,
+      images: images,
     );
   }
 
@@ -305,8 +329,16 @@ class EpubParser {
 class EpubBlock {
   final String text;
   final bool isHeading;
-  const EpubBlock(this.text, this.isHeading);
+  /// Raw <img> src for an illustration block (text is empty).
+  final String? imageSrc;
+  const EpubBlock(this.text, this.isHeading, [this.imageSrc]);
 }
+
+/// Paragraph marker for an EPUB illustration: the paragraph
+/// text is this prefix + the image index into ParsedBook.images.
+/// Real book text never contains \\u0001, so markers can never
+/// collide with prose. The reader renders these as images.
+const kEpubImageMarker = '\u0001INKBLOOM_IMG:';
 
 /// Converts a small XHTML fragment into heading/paragraph blocks.
 /// Headings are kept as the first block so chapter titles survive.
@@ -322,30 +354,67 @@ List<EpubBlock> htmlToBlocks(String html) {
     r'<(h[1-3]|p|div)[^>]*>([\s\S]*?)</\1>',
     caseSensitive: false,
   );
-  for (final m in re.allMatches(s)) {
-    final tag = m.group(1)!.toLowerCase();
-    var inner = m.group(2)!;
+  // The trailing [^>]*> matters: without it the match ends at
+  // the src quote and the rest of the tag (alt="..."/>)
+  // survives tag-stripping as garbage text.
+  final imgRe = RegExp(
+    r'''<img[^>]*src=(?:"([^"]+)"|'([^']+)')[^>]*>''',
+    caseSensitive: false,
+  );
+  void addText(String chunk, bool isHeadingBlock, bool first) {
+    var inner = chunk;
     inner = inner.replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '\n');
     inner = inner.replaceAll(RegExp(r'<[^>]+>'), ' ');
     inner = _unescape(inner).replaceAll(RegExp(r'[ \t]+'), ' ').trim();
-    if (inner.isEmpty) continue;
+    if (inner.isEmpty) return;
     // Split on newlines inside a block into separate paragraphs.
     final parts = inner
         .split('\n')
         .map((p) => p.trim())
         .where((p) => p.isNotEmpty);
-    var first = true;
+    var firstPart = first;
     for (final part in parts) {
-      blocks.add(EpubBlock(part, tag.startsWith('h') && first));
-      first = false;
+      blocks.add(EpubBlock(part, isHeadingBlock && firstPart));
+      firstPart = false;
     }
+  }
+  for (final m in re.allMatches(s)) {
+    final tag = m.group(1)!.toLowerCase();
+    final inner = m.group(2)!;
+    final isHeadingBlock = tag.startsWith('h');
+    // Illustrations stay in document order between the text
+    // around them; the old code stripped <img> entirely, so
+    // book art never reached the reader at all.
+    var pos = 0;
+    var first = true;
+    for (final im in imgRe.allMatches(inner)) {
+      addText(inner.substring(pos, im.start), isHeadingBlock, first);
+      first = false;
+      final src = im.group(1) ?? im.group(2);
+      if (src != null && src.isNotEmpty) {
+        blocks.add(EpubBlock('', false, src));
+      }
+      pos = im.end;
+    }
+    addText(inner.substring(pos), isHeadingBlock, first);
   }
   // Fallback: whole document as one block if no p/h tags were found.
   if (blocks.isEmpty) {
     final plain = _unescape(s.replaceAll(RegExp(r'<[^>]+>'), ' '))
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
-    if (plain.isNotEmpty) blocks.add(EpubBlock(plain, false));
+    if (plain.isNotEmpty) {
+      blocks.add(EpubBlock(plain, false));
+    } else {
+      // Image-only document (a full-page illustration chapter):
+      // keep the pictures instead of dropping the chapter.
+      for (final im in imgRe.allMatches(s)) {
+        final src = im.group(1) ?? im.group(2);
+        if (src != null && src.isNotEmpty) {
+          blocks.add(EpubBlock('', false, src));
+        }
+      }
+    }
   }
   return blocks;
 }

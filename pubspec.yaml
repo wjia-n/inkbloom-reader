@@ -1,7 +1,7 @@
 name: inkbloom_reader
 description: "InkBloom Reader - a calm, beautiful EPUB reader"
 publish_to: 'none'
-version: 1.1.7+18
+version: 1.1.8+19
 environment:
   sdk: ^3.13.5
 dependencies:

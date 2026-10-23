@@ -147,6 +147,61 @@ Future<Directory> _coversDir() async {
   return d;
 }
 
+/// EPUB illustration files for a book, in marker order.
+/// Written at parse time; the reader loads them on open when
+/// the cached chapters contain image markers. Illustrations
+/// are always derivable from the book file, never the sole
+/// copy of anything, so they are not part of backups.
+Future<void> _writeBookImages(
+    Directory dir, String bookId, List<Uint8List> images) async {
+  for (var i = 0; i < images.length; i++) {
+    try {
+      await File('${dir.path}/$bookId.img.$i').writeAsBytes(images[i]);
+    } catch (_) {}
+  }
+}
+
+Future<List<Uint8List>?> _readBookImages(
+    Directory dir, String bookId, int count) async {
+  final out = <Uint8List>[];
+  for (var i = 0; i < count; i++) {
+    try {
+      final f = File('${dir.path}/$bookId.img.$i');
+      if (!await f.exists()) return null;
+      out.add(await f.readAsBytes());
+    } catch (_) {
+      return null;
+    }
+  }
+  return out;
+}
+
+Future<void> _deleteBookImages(Directory dir, String bookId) async {
+  try {
+    await for (final e in dir.list()) {
+      if (e.uri.pathSegments.last.startsWith('$bookId.img.')) {
+        try {
+          await e.delete();
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+}
+
+/// Highest illustration index referenced by [chapters], or -1.
+int _maxImageMarker(List<EpubChapter> chapters) {
+  var max = -1;
+  for (final c in chapters) {
+    for (final para in c.paragraphs) {
+      if (para.startsWith(kEpubImageMarker)) {
+        final idx = int.tryParse(para.substring(kEpubImageMarker.length));
+        if (idx != null && idx > max) max = idx;
+      }
+    }
+  }
+  return max;
+}
+
 /// Small white tool card used on the library home (Stitch reference).
 class _ToolCard extends StatelessWidget {
   final IconData icon;
@@ -282,7 +337,16 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     // is never torn itself.
     var backupUsed = false;
     if (saved.where((b) => !b.isBuiltin).isEmpty) {
-      final backupJson = await LibraryBackup.read(await _booksDir());
+      // A hung backup read must never hang the whole load
+      // (a stuck _load used to leave the safety-net samples
+      // on screen with saves blocked behind _libraryLoaded).
+      String? backupJson;
+      try {
+        backupJson = await LibraryBackup.read(await _booksDir())
+            .timeout(const Duration(seconds: 5));
+      } catch (_) {
+        backupJson = null;
+      }
       if (backupJson != null) {
         final backupBooks = <LibraryBook>[];
         try {
@@ -307,7 +371,12 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     for (final s in saved) {
       if (s.isBuiltin) {
         final sample = builtIns.where((b) => b.id == s.id).firstOrNull;
-        if (sample != null) {
+        if (sample == null) {
+          // Unknown "builtin" (no matching sample): keep the
+          // saved book as-is. Dropping it here used to make
+          // books vanish from the library on load.
+          result.add(s);
+        } else {
           result.add(LibraryBook(
             id: sample.id,
             title: sample.title,
@@ -581,8 +650,12 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
       // Cache the background parse too, so the first open
       // after import is instant even for a big PDF.
       if (old.filePath != null) {
-        await BookCache.write(await _booksDir(), id, parsed.chapters,
+        final dir = await _booksDir();
+        await BookCache.write(dir, id, parsed.chapters,
             File(old.filePath!));
+        if (parsed.images.isNotEmpty) {
+          await _writeBookImages(dir, id, parsed.images);
+        }
       }
     } catch (_) {
       // Chapter parsing failed, but the book is NOT lost — and
@@ -714,6 +787,10 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
   }
 
   Future<void> _openBook(LibraryBook book) async {
+    // Illustrations handed to the reader (from the cache, the
+    // fresh parse, or the preview); declared up here because
+    // the cache branch below runs before the parse section.
+    var openImages = <Uint8List>[];
     // Fast path: a previous parse is cached on disk (see
     // BookCache). A big PDF then opens in milliseconds instead
     // of re-running the whole extraction every time.
@@ -721,14 +798,26 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
       final cached = await BookCache.read(
           await _booksDir(), book.id, File(book.filePath!));
       if (cached != null && cached.isNotEmpty) {
-        final withCached =
-            book.copyWith(chapters: cached, lastReadAt: DateTime.now());
-        setState(() {
-          final i = _books.indexWhere((b) => b.id == book.id);
-          if (i >= 0) _books[i] = withCached;
-        });
-        book = withCached;
-        _persist();
+        // Illustrations: cached chapters may reference image
+        // files. If the files are gone, skip the cache and
+        // re-parse below so the art regenerates instead of
+        // showing broken markers.
+        final dir = await _booksDir();
+        final maxMarker = _maxImageMarker(cached);
+        final cachedImages = maxMarker >= 0
+            ? await _readBookImages(dir, book.id, maxMarker + 1)
+            : <Uint8List>[];
+        if (maxMarker < 0 || cachedImages != null) {
+          openImages = cachedImages ?? [];
+          final withCached =
+              book.copyWith(chapters: cached, lastReadAt: DateTime.now());
+          setState(() {
+            final i = _books.indexWhere((b) => b.id == book.id);
+            if (i >= 0) _books[i] = withCached;
+          });
+          book = withCached;
+          _persist();
+        }
       }
     }
     // Lazy parse: a saved imported book has no chapters in memory
@@ -790,6 +879,9 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
               final dir = await _booksDir();
               await BookCache.write(
                   dir, book.id, full.chapters, File(book.filePath!));
+              if (full.images.isNotEmpty) {
+                await _writeBookImages(dir, book.id, full.images);
+              }
               return full;
             } catch (_) {
               return null;
@@ -882,6 +974,14 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
           // ignore: unawaited_futures
           BookCache.write(cacheDir, book.id, parsed.chapters,
               File(book.filePath!));
+          if (parsed.images.isNotEmpty) {
+            openImages = parsed.images;
+            await _writeBookImages(cacheDir, book.id, parsed.images);
+          }
+        } else if (parsed.images.isNotEmpty) {
+          // Preview art (first pages only); the full parse
+          // replaces it when it lands.
+          openImages = parsed.images;
         }
       } catch (e) {
         if (openCancelled) return;
@@ -965,6 +1065,7 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
           onSettingsChanged: _updateSettings,
           pendingFull: pendingFull,
           onProgressChanged: (b) => _updateBook(b),
+          images: openImages,
         ),
       ),
     );
@@ -1114,6 +1215,9 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         break;
       case 'Author':
         list.sort((a, b) => a.author.compareTo(b.author));
+        break;
+      case 'Recent':
+        list.sort(compareBooksRecent);
         break;
       default:
         list.sort((a, b) => b.addedAt.compareTo(a.addedAt));
@@ -1724,9 +1828,12 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
       setState(() => _books.removeWhere((b) => b.id == book.id));
       _persist();
       // The cache is regenerable; leaving it would orphan
-      // megabytes per deleted book.
+      // megabytes per deleted book. Illustrations likewise.
       // ignore: unawaited_futures
-      _booksDir().then((dir) => BookCache.delete(dir, book.id));
+      _booksDir().then((dir) async {
+        await BookCache.delete(dir, book.id);
+        await _deleteBookImages(dir, book.id);
+      });
       return;
     }
     if (v == 'fav') {
@@ -2431,6 +2538,10 @@ class ReaderScreen extends StatefulWidget {
   // normally. If the app is swiped away or killed mid-read,
   // the last saved position is at most 30 seconds old.
   final ValueChanged<LibraryBook>? onProgressChanged;
+  /// EPUB illustrations, in marker order (empty for books
+  /// without art). The reader renders marker paragraphs
+  /// from this list; cache-hit opens load it from disk.
+  final List<Uint8List>? images;
   const ReaderScreen({
     super.key,
     required this.book,
@@ -2438,6 +2549,7 @@ class ReaderScreen extends StatefulWidget {
     required this.onSettingsChanged,
     this.pendingFull,
     this.onProgressChanged,
+    this.images,
   });
   @override
   State<ReaderScreen> createState() => _ReaderScreenState();
@@ -2470,6 +2582,17 @@ class _ReaderScreenState extends State<ReaderScreen>
   ValueNotifier<ParsedBook?>? _pendingFull;
   VoidCallback? _fullListener;
   bool _fullArrived = false;
+  // Saved position, kept separately from the displayed one:
+  // a progressive PDF preview covers only the first chapters,
+  // so clamping to the preview used to LOSE the real saved
+  // chapter, and the full text landing never restored it.
+  int _savedChapter = 0;
+  int _savedPara = 0;
+  // True once the reader herself moves (chapter jump, page
+  // swipe, drag scroll). The full-text arrival only restores
+  // the saved position when she has NOT moved yet.
+  bool _userNavigated = false;
+  List<Uint8List> _images = [];
   late int _chapter;
   late List<int> _bookmarks;
   late List<Highlight> _highlights;
@@ -2511,41 +2634,66 @@ class _ReaderScreenState extends State<ReaderScreen>
     _s = widget.settings;
     _chapters = widget.book.chapters;
     _pendingFull = widget.pendingFull;
-    if (_pendingFull != null) {
-      _fullListener = () {
-        final full = _pendingFull!.value;
-        if (full != null && mounted) {
-          setState(() {
-            _chapters = full.chapters;
-            _chapter = _chapter.clamp(0, _chapters.length - 1);
-            _fullArrived = true;
-          });
-        }
-      };
-      _pendingFull!.addListener(_fullListener!);
-    }
+    _images = widget.images ?? [];
     // Controls start HIDDEN: the page is clean on open, and
     // a single tap brings the bars, the -/+ pill and the
     // chapter bar up. Nothing sits on the text otherwise.
     _barsVisible = false;
     applyBrightness(_s.brightness);
-    _chapter =
-        widget.book.lastChapter.clamp(0, _chapters.length - 1);
+    // The displayed chapter clamps to what is actually here
+    // (a preview may cover only the first chapters), but the
+    // SAVED chapter/paragraph are kept for the full text.
+    _chapter = _chapters.isEmpty
+        ? 0
+        : widget.book.lastChapter.clamp(0, _chapters.length - 1);
     _currentPara = widget.book.lastParagraph;
+    _savedChapter = widget.book.lastChapter;
+    _savedPara = widget.book.lastParagraph;
     var initialPage = 0;
     if (_s.readingMode == 1 && _chapters.isNotEmpty) {
       final pages = paginate(_chapters[_chapter].paragraphs, _s.fontSize);
-      var cum = 0;
-      for (var pi = 0; pi < pages.length; pi++) {
-        if (cum + pages[pi].length > _currentPara) {
-          initialPage = pi;
-          break;
-        }
-        cum += pages[pi].length;
-        initialPage = pi;
-      }
+      initialPage = pageIndexForParagraph(pages, _currentPara);
     }
     _pageController = PageController(initialPage: initialPage);
+    if (_pendingFull != null) {
+      _fullListener = () {
+        final full = _pendingFull!.value;
+        if (full == null || !mounted || full.chapters.isEmpty) return;
+        final wasNavigated = _userNavigated;
+        setState(() {
+          _chapters = full.chapters;
+          if (full.images.isNotEmpty) _images = full.images;
+          if (!wasNavigated) {
+            _chapter = _savedChapter.clamp(0, _chapters.length - 1);
+            final maxPara = _chapters[_chapter].paragraphs.length - 1;
+            _currentPara = maxPara <= 0 ? 0 : _savedPara.clamp(0, maxPara);
+          } else {
+            _chapter = _chapter.clamp(0, _chapters.length - 1);
+          }
+          _fullArrived = true;
+        });
+        if (!wasNavigated) {
+          if (_s.readingMode == 1) {
+            final pages =
+                paginate(_chapters[_chapter].paragraphs, _s.fontSize);
+            final target = pageIndexForParagraph(pages, _currentPara);
+            if (_pageController.hasClients) {
+              _pageController.jumpToPage(target);
+            }
+          } else {
+            // Cancel any in-flight preview seek, then seek to
+            // the true saved position in the full text.
+            _restoreSeekActive = false;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (!mounted || _userNavigated) return;
+              _restoreSeekActive = true;
+              _seekTo(_chapter, _currentPara, 0);
+            });
+          }
+        }
+      };
+      _pendingFull!.addListener(_fullListener!);
+    }
     // Continuous / single-chapter modes restore after the
     // first frame, once the list exists to scroll.
     if (_s.readingMode != 1 && (_chapter > 0 || _currentPara > 0)) {
@@ -2608,8 +2756,10 @@ class _ReaderScreenState extends State<ReaderScreen>
     }
     // Pauses between paragraphs: joining with spaces made
     // even a slow speed feel like one breathless rush.
-    final text =
-        _chapters[_chapter].paragraphs.join('\n\n');
+    final text = _chapters[_chapter]
+        .paragraphs
+        .where((p) => !p.startsWith(kEpubImageMarker))
+        .join('\n\n');
     final result = await _tts.speak(text);
     if (mounted) setState(() => _isSpeaking = result == 1);
   }
@@ -2700,6 +2850,7 @@ class _ReaderScreenState extends State<ReaderScreen>
 
   void _go(int chapter) {
     if (chapter < 0 || chapter >= _chapters.length) return;
+    _userNavigated = true;
     setState(() {
       _chapter = chapter;
     });
@@ -2844,6 +2995,7 @@ class _ReaderScreenState extends State<ReaderScreen>
   void _maybeSaveScrollPosition(ScrollNotification n) {
     if (n is ScrollStartNotification && n.dragDetails != null) {
       _userScrolled = true;
+      _userNavigated = true;
     }
     if (n is ScrollEndNotification) {
       _updateCurrentParaFromViewport();
@@ -2860,6 +3012,35 @@ class _ReaderScreenState extends State<ReaderScreen>
   }
 
   Widget _paragraphWidget(int chapterIdx, int paraIdx, String text) {
+    // EPUB illustrations render as images, not as marker text.
+    // The key stays on the wrapper so restore/seek tracking
+    // still sees this paragraph's position. Art is not
+    // highlightable and never read aloud.
+    if (text.startsWith(kEpubImageMarker)) {
+      final idx = int.tryParse(text.substring(kEpubImageMarker.length));
+      final bytes =
+          (idx != null && idx >= 0 && idx < _images.length) ? _images[idx] : null;
+      return KeyedSubtree(
+        key: _paraKeys.putIfAbsent('$chapterIdx:$paraIdx', () => GlobalKey()),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Center(
+            child: bytes != null
+                ? ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: Image.memory(bytes,
+                        fit: BoxFit.contain,
+                        errorBuilder: (_, __, ___) => const Icon(
+                            Icons.broken_image,
+                            size: 40,
+                            color: Colors.grey)),
+                  )
+                : const Icon(Icons.broken_image,
+                    size: 40, color: Colors.grey),
+          ),
+        ),
+      );
+    }
     final hl = _highlights
         .where((h) => h.chapter == chapterIdx && h.paragraph == paraIdx)
         .firstOrNull;
@@ -3249,6 +3430,7 @@ class _ReaderScreenState extends State<ReaderScreen>
         controller: _pageController,
         itemCount: pages.length,
         onPageChanged: (i) {
+          _userNavigated = true;
           var idx = 0;
           for (var p = 0; p < i; p++) {
             idx += pages[p].length;

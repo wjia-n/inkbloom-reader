@@ -44,6 +44,7 @@ Map<String, dynamic> parseBookIsolate(Map<String, dynamic> args) {
         .map((c) => {'title': c.title, 'paragraphs': c.paragraphs})
         .toList(),
     'cover': parsed.coverBytes,
+    'images': parsed.images,
     'partial': partialChars != null,
   };
 }
@@ -62,6 +63,7 @@ ParsedBook parsedBookFromIsolate(Map<String, dynamic> m) {
     format: m['format'] as String? ?? 'txt',
     chapters: chapters,
     coverBytes: m['cover'] as Uint8List?,
+    images: ((m['images'] as List?) ?? []).whereType<Uint8List>().toList(),
   );
 }
 

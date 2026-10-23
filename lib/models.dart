@@ -201,6 +201,8 @@ List<SearchHit> searchBook(LibraryBook book, String query) {
   for (var ci = 0; ci < book.chapters.length; ci++) {
     for (var pi = 0; pi < book.chapters[ci].paragraphs.length; pi++) {
       final p = book.chapters[ci].paragraphs[pi];
+      // Illustration markers are not prose; never a hit.
+      if (p.startsWith('\u0001')) continue;
       final idx = p.toLowerCase().indexOf(q);
       if (idx < 0) continue;
       final start = (idx - 40).clamp(0, p.length);
@@ -213,6 +215,24 @@ List<SearchHit> searchBook(LibraryBook book, String query) {
     }
   }
   return hits;
+}
+
+/// "Recent" order for the library: last-read first.
+/// Books never opened sort after read books, by added date.
+/// (The old default sorted by added date, so the book just
+/// read did NOT come first — the last-added book did.)
+int compareBooksRecent(LibraryBook a, LibraryBook b) {
+  final da = a.lastReadAt;
+  final db = b.lastReadAt;
+  if (da != null && db != null) {
+    final c = db.compareTo(da);
+    if (c != 0) return c;
+  } else if (da != null) {
+    return -1;
+  } else if (db != null) {
+    return 1;
+  }
+  return b.addedAt.compareTo(a.addedAt);
 }
 
 /// Three short original sample books so the app is useful on first launch.
