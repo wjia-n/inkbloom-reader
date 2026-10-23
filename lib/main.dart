@@ -17,7 +17,7 @@ import 'extra_screens.dart';
 import 'formats.dart';
 import 'epub_parser.dart';
 import 'book_cache.dart';
-import 'library_backup.dart';
+import 'phone_store.dart';
 import 'books_screens.dart';
 import 'brightness.dart';
 import 'share_review.dart';
@@ -145,6 +145,19 @@ Future<Directory> _coversDir() async {
   final d = Directory('${dir.path}/inkbloom_covers');
   if (!await d.exists()) await d.create(recursive: true);
   return d;
+}
+
+/// Stats prefer the phone-storage file, falling back to prefs.
+/// The reader writes both (see _recordReadingTime).
+Future<ReadingStats> _loadStats(SharedPreferences prefs,
+    [Directory? dir]) async {
+  try {
+    dir ??= await _booksDir().timeout(const Duration(seconds: 5));
+    final fileJson =
+        await PhoneStore.readStats(dir).timeout(const Duration(seconds: 5));
+    if (fileJson != null) return ReadingStats.fromJsonString(fileJson);
+  } catch (_) {}
+  return ReadingStats.fromJsonString(prefs.getString('inkbloom_stats'));
 }
 
 /// EPUB illustration files for a book, in marker order.
@@ -318,50 +331,61 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     // the whole library on a spinner and imported books never appeared.
     // Chapters are now parsed lazily, only when a book is opened.
     final prefs = await SharedPreferences.getInstance();
-    _settings =
-        ReaderSettings.fromJsonString(prefs.getString('inkbloom_settings'));
-    _stats = ReadingStats.fromJsonString(prefs.getString('inkbloom_stats'));
+    // The library's real home is the phone-storage snapshot
+    // file (flushed, atomic). Prefs and the legacy backup
+    // file are fallbacks only. Every file read is bounded
+    // so a stuck read can never hang the load (a stuck
+    // _load used to leave the safety-net samples on screen
+    // with saves blocked behind _libraryLoaded).
+    Directory? dir;
+    try {
+      dir = await _booksDir().timeout(const Duration(seconds: 5));
+    } catch (_) {
+      dir = null;
+    }
+    List<Map<String, dynamic>>? snapshotBooks;
+    List<Map<String, dynamic>>? legacyBooks;
+    Map<String, dynamic>? snapshotSettings;
+    if (dir != null) {
+      try {
+        final snap = await PhoneStore.readSnapshot(dir)
+            .timeout(const Duration(seconds: 5));
+        snapshotBooks = snap?.books;
+        snapshotSettings = snap?.settings;
+      } catch (_) {}
+      if (snapshotBooks == null || snapshotBooks.isEmpty) {
+        try {
+          legacyBooks = await PhoneStore.readLegacyBackup(dir)
+              .timeout(const Duration(seconds: 5));
+        } catch (_) {}
+      }
+    }
+    var settingsLoaded = false;
+    if (snapshotSettings != null) {
+      try {
+        _settings = ReaderSettings.fromJson(snapshotSettings);
+        settingsLoaded = true;
+      } catch (_) {}
+    }
+    if (!settingsLoaded) {
+      _settings =
+          ReaderSettings.fromJsonString(prefs.getString('inkbloom_settings'));
+    }
+    _stats = await _loadStats(prefs, dir);
     final raw = prefs.getString('inkbloom_library_v2');
-    final saved = <LibraryBook>[];
+    final prefsBooks = <Map<String, dynamic>>[];
     if (raw != null) {
       try {
         for (final e in jsonDecode(raw) as List) {
-          final b = LibraryBook.fromJson(e as Map<String, dynamic>);
-          if (b != null) saved.add(b);
+          if (e is Map<String, dynamic>) prefsBooks.add(e);
         }
       } catch (_) {}
     }
-    // Second chance: if prefs yielded no real books, the
-    // backup file may still have them (torn prefs write,
-    // wiped key). The backup is written atomically, so it
-    // is never torn itself.
-    var backupUsed = false;
-    if (saved.where((b) => !b.isBuiltin).isEmpty) {
-      // A hung backup read must never hang the whole load
-      // (a stuck _load used to leave the safety-net samples
-      // on screen with saves blocked behind _libraryLoaded).
-      String? backupJson;
-      try {
-        backupJson = await LibraryBackup.read(await _booksDir())
-            .timeout(const Duration(seconds: 5));
-      } catch (_) {
-        backupJson = null;
-      }
-      if (backupJson != null) {
-        final backupBooks = <LibraryBook>[];
-        try {
-          for (final e in jsonDecode(backupJson) as List) {
-            final b = LibraryBook.fromJson(e as Map<String, dynamic>);
-            if (b != null) backupBooks.add(b);
-          }
-        } catch (_) {}
-        if (backupBooks.where((b) => !b.isBuiltin).isNotEmpty) {
-          saved
-            ..clear()
-            ..addAll(backupBooks);
-          backupUsed = true;
-        }
-      }
+    final saved = <LibraryBook>[];
+    for (final e in pickLibraryJson(
+        snapshot: snapshotBooks, legacy: legacyBooks, prefs: prefsBooks)) {
+      final b = LibraryBook.fromJson(e);
+      if (b != null) saved.add(b);
     }
     final builtIns = sampleBooks();
     // Books imported while _load() was still running (or
@@ -405,27 +429,33 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
         .where((b) => !result.any((r) => r.id == b.id))
         .toList();
     final merged = [...kept, ...result];
-    // Books were expected (prefs mentioned real files) but
-    // neither prefs nor backup produced any: the library is
-    // genuinely gone from storage. Tell the user (their
-    // files are still on the phone to re-import), but DO
-    // NOT block future saves the way the old guard did:
-    // blocking writes after a corrupt load is what turned
-    // one torn write into every later session vanishing
-    // on swipe-away. The corrupt value is unreadable, so
-    // overwriting it with a good one loses nothing.
-    final corrupt = saved.where((b) => !b.isBuiltin).isEmpty &&
-        raw != null &&
-        RegExp(r'"filePath"\s*:\s*"').hasMatch(raw);
+    // Some store mentioned real files but nothing parsed:
+    // the library is genuinely gone from storage. Tell the
+    // user (their files are still on the phone to re-import),
+    // but DO NOT block future saves the way the old guard
+    // did: blocking writes after a corrupt load is what
+    // turned one torn write into every later session
+    // vanishing on swipe-away.
+    var mentionsFiles = false;
+    for (final src in [snapshotBooks, legacyBooks, prefsBooks]) {
+      if (src == null) continue;
+      for (final e in src) {
+        final fp = e['filePath'];
+        if (fp is String && fp.isNotEmpty) mentionsFiles = true;
+      }
+    }
+    final corrupt =
+        saved.where((b) => !b.isBuiltin).isEmpty && mentionsFiles;
     if (!mounted) return;
     setState(() {
       _books = merged;
       _loading = false;
       _libraryLoaded = true;
     });
-    // Heal prefs from the backup, and persist any books
-    // that arrived while loading was still running.
-    if (kept.isNotEmpty || backupUsed) await _persist();
+    // Re-sync every store to the loaded state (and guarantee
+    // a snapshot file exists for the next launch), including
+    // any books that arrived while loading was still running.
+    await _persist();
     if (corrupt && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text(
@@ -440,12 +470,16 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     // _libraryLoaded): an early persist would wipe the saved
     // books with whatever partial list is in memory.
     if (_libraryLoaded) {
-      final json = jsonEncode(_books.map((b) => b.toJson()).toList());
-      await prefs.setString('inkbloom_library_v2', json);
-      // Second copy in its own atomically-renamed file, so
-      // a torn prefs write can never again lose the library:
-      // the next load heals prefs from this file.
-      await LibraryBackup.write(await _booksDir(), json);
+      final bookJson = _books.map((b) => b.toJson()).toList();
+      // Phone storage FIRST (flushed, atomic): this is the
+      // library's real home now. Prefs stay as a fallback.
+      try {
+        await PhoneStore.writeSnapshot(await _booksDir(),
+                books: bookJson, settings: _settings.toJson())
+            .timeout(const Duration(seconds: 5));
+      } catch (_) {}
+      await prefs.setString(
+          'inkbloom_library_v2', jsonEncode(bookJson));
     }
     await prefs.setString(
         'inkbloom_settings', jsonEncode(_settings.toJson()));
@@ -1073,10 +1107,10 @@ class _LibraryScreenState extends State<LibraryScreen> with RouteAware {
     // library: the reader recorded minutes while you read, and
     // the library must not persist its stale snapshot over them.
     final prefs = await SharedPreferences.getInstance();
+    final freshStats = await _loadStats(prefs);
     if (mounted) {
       setState(() {
-        _stats =
-            ReadingStats.fromJsonString(prefs.getString('inkbloom_stats'));
+        _stats = freshStats;
       });
     }
     if (updated != null) _updateBook(updated);
@@ -2063,11 +2097,44 @@ class AppSettingsScreen extends StatefulWidget {
 
 class _AppSettingsScreenState extends State<AppSettingsScreen> {
   late ReaderSettings _s;
+  String _storageLine = 'Checking phone storage…';
 
   @override
   void initState() {
     super.initState();
     _s = widget.settings;
+    _loadStorageLine();
+  }
+
+  /// Proof the library is really on this phone: how many
+  /// books the phone-storage file holds, and when last saved.
+  Future<void> _loadStorageLine() async {
+    try {
+      final dir = await _booksDir().timeout(const Duration(seconds: 5));
+      final st = await PhoneStore.storageStatus(dir);
+      if (!mounted) return;
+      setState(() {
+        if (st.count > 0) {
+          const months = [
+            'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+            'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+          ];
+          final t = st.savedAt?.toLocal();
+          final when = t == null
+              ? 'backup copy'
+              : 'last save ${months[t.month - 1]} ${t.day}, '
+                  '${t.hour.toString().padLeft(2, '0')}:'
+                  '${t.minute.toString().padLeft(2, '0')}';
+          _storageLine = 'On this phone: ${st.count} books saved • $when';
+        } else {
+          _storageLine = 'Nothing saved on this phone yet';
+        }
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() => _storageLine = 'Phone storage check unavailable');
+      }
+    }
   }
 
   @override
@@ -2493,6 +2560,11 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
             'Fully offline • No account needed',
             style: TextStyle(color: Colors.grey),
           ),
+          const SizedBox(height: 4),
+          Text(
+            _storageLine,
+            style: const TextStyle(color: Colors.grey),
+          ),
         ],
       ),
     );
@@ -2716,10 +2788,11 @@ class _ReaderScreenState extends State<ReaderScreen>
   Future<void> _loadReaderExtras() async {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
+    final loadedStats = await _loadStats(prefs);
+    if (!mounted) return;
     setState(() {
       _showTapHint = !(prefs.getBool('inkbloom_tap_hint_shown') ?? false);
-      _stats =
-          ReadingStats.fromJsonString(prefs.getString('inkbloom_stats'));
+      _stats = loadedStats;
       try {
         final raw = prefs.getString('inkbloom_custom_dict');
         if (raw != null) {
@@ -2736,8 +2809,15 @@ class _ReaderScreenState extends State<ReaderScreen>
     _lastTick = now;
     if (minutes <= 0) return;
     _stats = _stats.recordMinutes(minutes);
+    final statsJson = jsonEncode(_stats.toJson());
+    // Phone-storage file first (flushed, atomic), prefs as
+    // fallback — the same split as the library snapshot.
+    try {
+      await PhoneStore.writeStats(await _booksDir(), statsJson)
+          .timeout(const Duration(seconds: 5));
+    } catch (_) {}
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('inkbloom_stats', jsonEncode(_stats.toJson()));
+    await prefs.setString('inkbloom_stats', statsJson);
     // Same tick also saves the book's position, so a kill or
     // swipe-away loses at most 30 seconds of reading.
     widget.onProgressChanged?.call(_bookToReturn());
